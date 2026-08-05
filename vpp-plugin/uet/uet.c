@@ -483,7 +483,9 @@ uet_protocols_register (vlib_main_t *vm)
 
   if (um->protocols_registered)
     return 0;
-  if (udp_is_valid_dst_port (UET_UDP_PORT, 1 /* is_ip4 */) ||
+  if (ip4_main.lookup_main.local_next_by_ip_protocol[UET_IP_PROTOCOL] != IP_LOCAL_NEXT_PUNT ||
+      ip6_main.lookup_main.local_next_by_ip_protocol[UET_IP_PROTOCOL] != IP_LOCAL_NEXT_PUNT ||
+      udp_is_valid_dst_port (UET_UDP_PORT, 1 /* is_ip4 */) ||
       udp_is_valid_dst_port (UET_UDP_PORT, 0 /* is_ip4 */))
     return VNET_API_ERROR_ADDRESS_IN_USE;
 
@@ -649,10 +651,16 @@ uet_enable_disable_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cl
   u8 enable = 1;
   int rv;
 
-  if (unformat (input, "disable"))
-    enable = 0;
-  else
-    unformat (input, "enable");
+  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    {
+      if (unformat (input, "disable"))
+	enable = 0;
+      else if (!unformat (input, "enable"))
+	return clib_error_return (0, "unknown input `%U'", format_unformat_error, input);
+
+      if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+	return clib_error_return (0, "unexpected input `%U'", format_unformat_error, input);
+    }
 
   rv = uet_enable_disable (enable);
   if (rv == VNET_API_ERROR_INVALID_WORKER)
@@ -709,8 +717,12 @@ VLIB_CLI_COMMAND (uet_svm_create_command, static) = {
 static clib_error_t *
 uet_svm_delete_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
 {
-  int rv = uet_svm_delete ();
+  int rv;
 
+  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    return clib_error_return (0, "unexpected input `%U'", format_unformat_error, input);
+
+  rv = uet_svm_delete ();
   if (rv)
     return clib_error_return (0, "UET SVM delete failed: %U", format_vnet_api_errno, rv);
   return 0;
@@ -795,6 +807,9 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   u32 worker_count = vlib_num_workers ();
   uet_vpp_svm_shared_header_t *first_header = 0;
   uet_cli_worker_snapshot_t *worker_snapshots = 0;
+
+  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    return clib_error_return (0, "unexpected input `%U'", format_unformat_error, input);
 
   if (worker_count && um->workers)
     {

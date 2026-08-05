@@ -8,18 +8,6 @@
 #define UET_VPP_DMA_ABI_MAGIC	0x414d4455U
 #define UET_VPP_DMA_ABI_VERSION 1
 
-typedef enum
-{
-  UET_VPP_DMA_REQUEST_GET_POOL = 1,
-} uet_vpp_dma_request_type_t;
-
-typedef struct
-{
-  uint32_t magic;
-  uint16_t version;
-  uint16_t type;
-} uet_vpp_dma_request_t;
-
 typedef struct
 {
   uint32_t magic;
@@ -40,7 +28,6 @@ typedef struct
 #define UET_VPP_DMA_STATIC_ASSERT _Static_assert
 #endif
 
-UET_VPP_DMA_STATIC_ASSERT (sizeof (uet_vpp_dma_request_t) == 8, "unexpected UET DMA request size");
 UET_VPP_DMA_STATIC_ASSERT (sizeof (uet_vpp_dma_reply_t) == 40, "unexpected UET DMA reply size");
 
 #undef UET_VPP_DMA_STATIC_ASSERT

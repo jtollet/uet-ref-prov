@@ -5,6 +5,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <vppinfra/mem.h>
+
 #include <uet_vpp_client.h>
 
 static int
@@ -12,6 +14,8 @@ expected_result (const char *mode, int *hold)
 {
   *hold = 0;
   if (!strcmp (mode, "expect-success"))
+    return 0;
+  if (!strcmp (mode, "expect-existing-heap"))
     return 0;
   if (!strcmp (mode, "expect-busy"))
     return -EBUSY;
@@ -38,10 +42,17 @@ main (int argc, char **argv)
     {
       fprintf (stderr,
 	       "usage: %s <segment-name> "
-	       "<expect-success|expect-busy|expect-owner-dead|expect-double-busy|hold|hold-dma> "
+	       "<expect-success|expect-existing-heap|expect-busy|expect-owner-dead|"
+	       "expect-double-busy|hold|hold-dma> "
 	       "[dma-socket]\n",
 	       argv[0]);
       return 2;
+    }
+
+  if (!strcmp (argv[2], "expect-existing-heap") && !clib_mem_init (0, 1U << 20))
+    {
+      fprintf (stderr, "failed to initialize the existing VPP heap\n");
+      return 1;
     }
 
   rc = uet_vpp_client_open (&client, argv[1], 0);

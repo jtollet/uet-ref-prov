@@ -139,6 +139,10 @@ uet_dma_listener_init (void)
 
   file.read_function = uet_dma_accept_ready;
   file.file_descriptor = listener->fd;
+  /* The socket object owns the descriptor and unlinks the Unix socket on
+   * close.  Keep clib_file_del_by_index() from closing the descriptor first.
+   */
+  file.dont_close = 1;
   file.description = format (0, "UET DMA listener %s", listener->config);
   um->dma_listener_file_index = clib_file_add (&file_main, &file);
   um->dma_listener = listener;

@@ -208,6 +208,7 @@ grep -q '^tx-completions-pending 0$' <<<"$status"
 grep -q '^worker-0-owner-pid 0$' <<<"$status"
 
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-double-busy
+LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-existing-heap
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-success
 "${cli[@]}" show uet | tr -d '\r' | grep -q '^worker-0-owner-pid 0$'
 

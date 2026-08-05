@@ -79,53 +79,83 @@ uet_vpp_client_wait_dma_ack (uet_vpp_client_t *client, int expected)
 static void
 uet_vpp_heap_init (void)
 {
-  if (clib_mem_init (0, UET_VPP_CLIENT_HEAP_SIZE))
+  /* Applications embedding another VPP client library may already have a
+   * VPP heap.  Reuse it instead of trying to initialize a second main heap.
+   */
+  if (clib_mem_get_heap () || clib_mem_init (0, UET_VPP_CLIENT_HEAP_SIZE))
     uet_vpp_heap_error = 0;
 }
 
 static int
-uet_vpp_header_is_compatible (const uet_vpp_svm_shared_header_t *header, uint64_t mapped_size)
+uet_vpp_range_is_valid (uint64_t offset, uint64_t length, uint64_t size)
+{
+  return offset <= size && length <= size - offset;
+}
+
+static int
+uet_vpp_header_is_compatible (const uet_vpp_svm_shared_header_t *header, uint64_t header_offset,
+			       uint64_t mapped_size)
 {
   if (header->magic != UET_VPP_SVM_ABI_MAGIC || header->abi_major != UET_VPP_SVM_ABI_MAJOR ||
       header->abi_minor < UET_VPP_SVM_ABI_MINOR || header->header_size < sizeof (*header) ||
       (header->capabilities & UET_VPP_SVM_REQUIRED_CAPABILITIES) !=
 	UET_VPP_SVM_REQUIRED_CAPABILITIES ||
       header->queue_depth < UET_VPP_SVM_MIN_QUEUE_DEPTH ||
-      header->queue_depth > UET_VPP_SVM_MAX_QUEUE_DEPTH || header->segment_size > mapped_size)
+      header->queue_depth > UET_VPP_SVM_MAX_QUEUE_DEPTH || header->segment_size > mapped_size ||
+      !uet_vpp_range_is_valid (header_offset, header->header_size, header->segment_size))
     return 0;
 
   if (header->dma_slot_count != header->queue_depth ||
       header->dma_slot_desc_size != sizeof (uet_vpp_svm_dma_slot_t) ||
       header->dma_buffer_data_size == 0 || header->dma_map_size == 0 ||
-      header->dma_slot_table_offset > header->segment_size ||
-      (uint64_t) header->dma_slot_count * header->dma_slot_desc_size >
-	header->segment_size - header->dma_slot_table_offset)
+      !uet_vpp_range_is_valid (header->dma_slot_table_offset,
+				(uint64_t) header->dma_slot_count * header->dma_slot_desc_size,
+				header->segment_size))
     return 0;
 
   if (header->tx_ring_size != header->queue_depth ||
       header->tx_desc_size != sizeof (uet_vpp_svm_tx_desc_t) ||
       header->tx_completion_size != sizeof (uet_vpp_svm_tx_completion_t) ||
-      header->tx_ring_offset > header->segment_size ||
-      sizeof (uet_vpp_svm_spsc_ring_t) + (uint64_t) header->tx_ring_size * header->tx_desc_size >
-	header->segment_size - header->tx_ring_offset ||
-      header->tx_completion_ring_offset > header->segment_size ||
-      sizeof (uet_vpp_svm_spsc_ring_t) +
-	  (uint64_t) header->tx_ring_size * header->tx_completion_size >
-	header->segment_size - header->tx_completion_ring_offset)
+      !uet_vpp_range_is_valid (
+	header->tx_ring_offset,
+	sizeof (uet_vpp_svm_spsc_ring_t) +
+	  (uint64_t) header->tx_ring_size * header->tx_desc_size,
+	header->segment_size) ||
+      !uet_vpp_range_is_valid (
+	header->tx_completion_ring_offset,
+	sizeof (uet_vpp_svm_spsc_ring_t) +
+	  (uint64_t) header->tx_ring_size * header->tx_completion_size,
+	header->segment_size))
     return 0;
 
   if (header->rx_ring_size != header->queue_depth ||
       header->rx_desc_size != sizeof (uet_vpp_svm_rx_desc_t) ||
       header->rx_release_size != sizeof (uet_vpp_svm_rx_release_t) ||
-      header->rx_ring_offset > header->segment_size ||
-      sizeof (uet_vpp_svm_spsc_ring_t) + (uint64_t) header->rx_ring_size * header->rx_desc_size >
-	header->segment_size - header->rx_ring_offset ||
-      header->rx_release_ring_offset > header->segment_size ||
-      sizeof (uet_vpp_svm_spsc_ring_t) + (uint64_t) header->rx_ring_size * header->rx_release_size >
-	header->segment_size - header->rx_release_ring_offset)
+      !uet_vpp_range_is_valid (
+	header->rx_ring_offset,
+	sizeof (uet_vpp_svm_spsc_ring_t) +
+	  (uint64_t) header->rx_ring_size * header->rx_desc_size,
+	header->segment_size) ||
+      !uet_vpp_range_is_valid (
+	header->rx_release_ring_offset,
+	sizeof (uet_vpp_svm_spsc_ring_t) +
+	  (uint64_t) header->rx_ring_size * header->rx_release_size,
+	header->segment_size))
     return 0;
 
   return 1;
+}
+
+static int
+uet_vpp_ring_is_compatible (const uet_vpp_svm_spsc_ring_t *ring, uint32_t expected_size)
+{
+  uint32_t expected_mask =
+    (expected_size & (expected_size - 1)) == 0 ? expected_size - 1 : 0;
+  uint32_t producer = __atomic_load_n (&ring->producer, __ATOMIC_ACQUIRE);
+  uint32_t consumer = __atomic_load_n (&ring->consumer, __ATOMIC_ACQUIRE);
+
+  return ring->size == expected_size && ring->mask == expected_mask &&
+	 producer - consumer <= expected_size;
 }
 
 static int
@@ -208,6 +238,7 @@ uet_vpp_client_open (uet_vpp_client_t **client_out, const char *segment_name,
 		     uet_vpp_client_info_t *info)
 {
   uet_vpp_client_t *client;
+  uint64_t header_offset;
   int rv;
 
   if (!client_out || !segment_name || !segment_name[0])
@@ -240,9 +271,19 @@ uet_vpp_client_open (uet_vpp_client_t **client_out, const char *segment_name,
       return -ECONNREFUSED;
     }
 
-  client->header = (uet_vpp_svm_shared_header_t *) ((uint8_t *) client->segment.sh +
-						    (uintptr_t) client->segment.sh->opaque[0]);
-  if (!uet_vpp_header_is_compatible (client->header, client->segment.ssvm_size))
+  header_offset = (uintptr_t) client->segment.sh->opaque[0];
+  if (client->segment.ssvm_size < sizeof (*client->segment.sh) ||
+      header_offset < sizeof (*client->segment.sh) ||
+      header_offset % UET_VPP_SVM_SHARED_ALIGNMENT != 0 ||
+      !uet_vpp_range_is_valid (header_offset, sizeof (*client->header), client->segment.ssvm_size))
+    {
+      uet_vpp_client_unmap (client);
+      free (client);
+      return -EPROTO;
+    }
+  client->header =
+    (uet_vpp_svm_shared_header_t *) ((uint8_t *) client->segment.sh + header_offset);
+  if (!uet_vpp_header_is_compatible (client->header, header_offset, client->segment.ssvm_size))
     {
       uet_vpp_client_unmap (client);
       free (client);
@@ -272,12 +313,10 @@ uet_vpp_client_open (uet_vpp_client_t **client_out, const char *segment_name,
   client->rx_release_ring = (uet_vpp_svm_spsc_ring_t *) ((uint8_t *) client->segment.sh +
 							 client->header->rx_release_ring_offset);
   client->rx_release_entries = (uet_vpp_svm_rx_release_t *) (client->rx_release_ring + 1);
-  if (client->tx_ring->size != client->header->tx_ring_size ||
-      client->tx_completion_ring->size != client->header->tx_ring_size ||
-      client->tx_ring->mask != client->tx_completion_ring->mask ||
-      client->rx_ring->size != client->header->rx_ring_size ||
-      client->rx_release_ring->size != client->header->rx_ring_size ||
-      client->rx_ring->mask != client->rx_release_ring->mask)
+  if (!uet_vpp_ring_is_compatible (client->tx_ring, client->header->tx_ring_size) ||
+      !uet_vpp_ring_is_compatible (client->tx_completion_ring, client->header->tx_ring_size) ||
+      !uet_vpp_ring_is_compatible (client->rx_ring, client->header->rx_ring_size) ||
+      !uet_vpp_ring_is_compatible (client->rx_release_ring, client->header->rx_ring_size))
     {
       uet_vpp_client_unmap (client);
       free (client);

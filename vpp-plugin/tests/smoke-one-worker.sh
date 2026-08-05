@@ -71,6 +71,13 @@ fi
 
 cli=("$vppctl_bin" -s "$runtime_dir/cli.sock")
 
+unexpected_output=$("${cli[@]}" uet enable unexpected 2>&1 || true)
+grep -Eq '(unexpected|unknown) input' <<<"$unexpected_output"
+unexpected_output=$("${cli[@]}" show uet unexpected 2>&1 || true)
+grep -Eq '(unexpected|unknown) input' <<<"$unexpected_output"
+unexpected_output=$("${cli[@]}" uet svm delete unexpected 2>&1 || true)
+grep -Eq '(unexpected|unknown) input' <<<"$unexpected_output"
+
 "${cli[@]}" show version
 "${cli[@]}" show threads
 "${cli[@]}" show plugins | grep -F uet_plugin.so
