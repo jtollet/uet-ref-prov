@@ -57,6 +57,27 @@ There are currently two implementations of the NIC shim interface APIs:
 Testing is performed using a simple top-level program that performs ping-pong
 message data transfer operations between a client and a server (see `uet.c`).
 
+An experimental out-of-tree VPP UET host-dataplane plugin is under
+[`vpp-plugin`](vpp-plugin/README.md). Its two main benefits are dataplane
+scalability and VPP-native troubleshooting. The threading model uses one VPP
+main thread for control and one independent lockless SPSC channel per VPP
+worker; 1, 2, 4, and 8 workers are supported. Packet traces, per-node errors,
+counters, structured logs, per-worker state, CLI commands, and binary APIs
+make both control and dataplane failures directly observable with the normal
+VPP toolset. NIC access uses VPP's normal device and interface graphs and is
+not tied to a particular VPP driver. Hardware-specific validation is kept on
+the companion branch described in the plugin documentation. A reusable
+`libuet_vpp_client.so` adapter exposes routed zero-copy IP TX
+plus zero-copy RX/release rings over a VPP-exported physmem mapping. The `vpp`
+NIC shim connects the traditional provider to this adapter. RX is entered only
+through VPP's IPv4/IPv6 local dispatch for IP protocol 253 or UDP port 49150;
+transit packets remain in the routing graph.
+A DMA descriptor is exported only when the Unix peer PID matches a ready SSVM
+channel; authorized clients remain trusted because zero-copy RX currently
+requires mapping VPP's complete default buffer pool.
+A direct high-performance libfabric provider integration is the next
+integration milestone.
+
 ### Delivery Modes
 
 The `pds` backend (`UET_PDS=pds`) supports all four UET PDS delivery modes:
