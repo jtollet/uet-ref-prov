@@ -380,6 +380,16 @@ int uet_nic_initialize(struct uet_nic *nic)
 		nic->nic_finalize    = nic_xdp_finalize;
 		nic->nic_initialize  = nic_xdp_initialize;
 #endif
+#if ENABLE_VPP
+	} else if (strcmp(nic_shim, "vpp") == 0) {
+		nic->nic_getinfo     = nic_vpp_getinfo;
+		nic->nic_get_nh      = nic_vpp_get_nh;
+		nic->nic_tx_pkt      = nic_vpp_tx_pkt;
+		nic->nic_rx_pkt      = nic_vpp_rx_pkt;
+		nic->nic_rx_poll     = nic_vpp_rx_poll;
+		nic->nic_finalize    = nic_vpp_finalize;
+		nic->nic_initialize  = nic_vpp_initialize;
+#endif
 	} else {
 		UET_API_ERR("invalid UET_NIC_SHIM environment variable");
 		return -ENODEV;
@@ -387,4 +397,3 @@ int uet_nic_initialize(struct uet_nic *nic)
 
 	return nic->nic_initialize(nic);
 }
-

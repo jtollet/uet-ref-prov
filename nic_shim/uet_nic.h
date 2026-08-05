@@ -23,6 +23,10 @@
 /* environment variables to control the NIC interface */
 #define UET_NIC_SHIM  "UET_NIC_SHIM"
 #define UET_IFNAME    "UET_IFNAME"
+#define UET_VPP_SEGMENT     "UET_VPP_SEGMENT"
+#define UET_VPP_DMA_SOCKET  "UET_VPP_DMA_SOCKET"
+#define UET_VPP_IPV4_ADDR   "UET_VPP_IPV4_ADDR"
+#define UET_VPP_IPV6_ADDR   "UET_VPP_IPV6_ADDR"
 
 #define UET_MAX_SYS_CMD_OCTETS  256
 #define UET_NET_TYPE_SIZE 32
@@ -83,6 +87,10 @@ struct uet_nic {
 	/* function pointers supporting different NIC interfaces */
 	int (*nic_getinfo)(struct uet_nic *nic,
 			   struct uet_nic_info *nic_info);
+	int (*nic_get_nh)(struct uet_nic *nic,
+			  const struct uet_fa *fa,
+			  bool is_ipv6,
+			  uint8_t *mac);
 	int (*nic_tx_pkt)(struct uet_nic *nic,
 			  void *pkt,
 			  void *iphdr,
@@ -276,6 +284,8 @@ static inline int uet_nic_get_nh(struct uet_nic *nic,
 	if (!nic || !fa || !mac)
 		assert(0);
 
+	if (nic->nic_get_nh)
+		return nic->nic_get_nh(nic, fa, is_ipv6, mac);
 	if (is_ipv6)
 		return uet_nic_get_ipv6_nh(nic, fa->v6, mac);
 	else
@@ -350,5 +360,19 @@ static inline int uet_nic_rx_poll(struct uet_nic *nic)
 
 	return nic->nic_rx_poll(nic);
 }
+
+#if ENABLE_VPP
+/* VPP client NIC protocol callbacks */
+int nic_vpp_getinfo(struct uet_nic *nic, struct uet_nic_info *nic_info);
+int nic_vpp_get_nh(struct uet_nic *nic, const struct uet_fa *fa,
+		   bool is_ipv6, uint8_t *mac);
+int nic_vpp_tx_pkt(struct uet_nic *nic, void *pkt, void *iphdr,
+		   size_t pkt_size);
+int nic_vpp_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
+		   size_t *rx_pkt_size);
+int nic_vpp_rx_poll(struct uet_nic *nic);
+void nic_vpp_finalize(struct uet_nic *nic);
+int nic_vpp_initialize(struct uet_nic *nic);
+#endif
 
 #endif /* _UET_NIC_H_ */

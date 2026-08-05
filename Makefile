@@ -103,6 +103,24 @@ PROVIDER_OBJ=$(patsubst %.c, $(PROVIDER_OBJ_DIR)/%.o, $(PROVIDER_SRC))
 PROVIDER_SMOKE=uet_provider_smoke
 PROVIDER_SMOKE_SRC=libfabric-provider/tests/provider_smoke.c
 
+# VPP functional-interoperability build. VPP_PLUGIN_BUILD points to the
+# out-of-tree plugin CMake build containing lib/libuet_vpp_client.so.
+VPP_PLUGIN_BUILD ?= build/vpp-plugin
+VPP_LIBNAME=vppuet
+VPP_LIB=lib$(VPP_LIBNAME).so
+VPP_LIB_SRC=$(filter-out uet.c, \
+	$(filter-out $(wildcard nic_shim/*xdp*), \
+		     $(wildcard *.c \
+			 util/*.c \
+			 imp_shim/*.c \
+			 nic_shim/*.c \
+			 crypto/*.c)))
+VPP_LIB_OBJ_DIR=obj_vpp_lib
+VPP_LIB_OBJ=$(patsubst %.c, $(VPP_LIB_OBJ_DIR)/%.o, $(VPP_LIB_SRC))
+VPP_BIN=uet_vpp
+VPP_OBJ_DIR=obj_vpp
+VPP_MAIN_OBJ=$(VPP_OBJ_DIR)/uet.o
+
 CC_SIM_BIN=uet_cc_sim
 CC_SIM_SRC=$(wildcard cc/*.c cc_sim/*.c)
 CC_SIM_OBJ_DIR=obj_cc_sim
@@ -119,6 +137,10 @@ provider: $(FABRIC_LIB) $(PROVIDER_LIB)
 provider-xdp: provider xdp-engine
 
 xdp-engine: $(XDP_LIB) $(XDP_KERN_BIN)
+
+vpp: $(VPP_BIN)
+
+provider-vpp: provider vpp
 
 provider-smoke: $(PROVIDER_SMOKE)
 
@@ -186,6 +208,29 @@ $(XDP_KERN_BIN): $(XDP_KERN_SRC)
 		  -I/usr/include/$(shell uname -m)-linux-gnu \
 		  -c -o $(XDP_KERN_BIN) $(XDP_KERN_SRC)
 
+$(VPP_LIB_OBJ_DIR)/%.o: %.c $(HDRS)
+	@mkdir -p $(VPP_LIB_OBJ_DIR)/$(dir $<)
+	@echo 'Building VPP library object: $<'
+	@$(CC) $(CFLAGS) -DENABLE_VERBS=0 -DENABLE_VPP=1 \
+		$(INCS) $(LF_LOCAL_HDRS) -Ivpp-plugin/client \
+		-fPIC -c -o $@ $<
+
+$(VPP_LIB): $(VPP_LIB_OBJ)
+	@echo 'Building VPP shared library: $@'
+	@$(CC) -shared $(VPP_LIB_OBJ) -o $@ $(LDFLAGS) \
+		-L$(VPP_PLUGIN_BUILD)/lib -luet_vpp_client
+
+$(VPP_OBJ_DIR)/%.o: %.c $(HDRS)
+	@mkdir -p $(VPP_OBJ_DIR)/$(dir $<)
+	@echo 'Building VPP file: $<'
+	@$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCS) $(LF_HDRS) -c -o $@ $<
+
+$(VPP_BIN): $(VPP_LIB) $(VPP_MAIN_OBJ)
+	@echo 'Building VPP program: $@'
+	@$(CC) $(VPP_MAIN_OBJ) -o $@ -L. -l$(VPP_LIBNAME) \
+		-L$(VPP_PLUGIN_BUILD)/lib -luet_vpp_client \
+		$(LDFLAGS) $(LF_LIBS)
+
 $(PROVIDER_OBJ_DIR)/%.o: %.c $(HDRS) $(PROVIDER_HDRS)
 	@mkdir -p $(PROVIDER_OBJ_DIR)/$(dir $<)
 	@echo 'Building libfabric provider object: $<'
@@ -219,6 +264,9 @@ clean:
 		$(XDP_KERN_BIN) \
 		$(PROVIDER_OBJ_DIR) $(PROVIDER_LIB) \
 		$(PROVIDER_SMOKE) \
+		$(VPP_LIB_OBJ_DIR) $(VPP_LIB) \
+		$(VPP_OBJ_DIR) $(VPP_BIN) \
 		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN)
 
-.PHONY: all xdp xdp-engine provider provider-xdp provider-smoke cc_sim clean
+.PHONY: all xdp xdp-engine vpp provider provider-xdp provider-vpp \
+	provider-smoke cc_sim clean
