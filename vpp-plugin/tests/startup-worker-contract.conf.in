@@ -1,0 +1,29 @@
+unix {
+  nodaemon
+  runtime-dir @RUNTIME_DIR@
+  cli-listen @RUNTIME_DIR@/cli.sock
+  log @RUNTIME_DIR@/vpp.log
+}
+
+api-segment {
+  prefix @API_PREFIX@
+}
+
+statseg {
+  socket-name @RUNTIME_DIR@/stats.sock
+}
+
+cpu {
+  main-core @MAIN_CORE@
+  @WORKER_STANZA@
+}
+
+buffers {
+  buffers-per-numa @BUFFERS_PER_NUMA@
+}
+
+plugins {
+  path @PLUGIN_DIR@
+  plugin default { disable }
+  plugin uet_plugin.so { enable }
+}

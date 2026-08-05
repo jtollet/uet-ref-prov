@@ -19,6 +19,7 @@ include_directories(${CMAKE_BINARY_DIR})
 
 add_subdirectory(uet)
 add_subdirectory(client)
+add_subdirectory(tools)
 
 option(UET_VPP_ENABLE_PACKAGING "Generate native VPP plugin packages" OFF)
 
