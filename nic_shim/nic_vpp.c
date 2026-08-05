@@ -25,6 +25,7 @@
 
 #define UET_NETWORK_TYPE_VPP "VPP"
 #define UET_VPP_TX_BATCH_SIZE 64
+#define UET_VPP_DEFAULT_MTU 1500
 #define UET_VPP_CLOSE_TIMEOUT_NS (5ULL * 1000 * 1000 * 1000)
 
 struct vpp_data {
@@ -36,19 +37,39 @@ struct vpp_data {
 	uint64_t tx_inflight;
 };
 
-static uint64_t nic_vpp_monotonic_ns(void)
+static int nic_vpp_monotonic_ns(uint64_t *now)
 {
 	struct timespec ts;
 
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-		return 0;
-	return (uint64_t)ts.tv_sec * 1000000000ULL +
+		return -errno;
+	*now = (uint64_t)ts.tv_sec * 1000000000ULL +
 	       (uint64_t)ts.tv_nsec;
+	return 0;
 }
 
-static int nic_vpp_progress_tx(struct vpp_data *vdata)
+static int nic_vpp_completion_error(int32_t status)
+{
+	switch (status) {
+	case UET_VPP_CLIENT_STATUS_OK:
+		return 0;
+	case UET_VPP_CLIENT_STATUS_INVALID_PACKET:
+		return -EINVAL;
+	case UET_VPP_CLIENT_STATUS_TX_NOT_CONFIGURED:
+		return -ENETDOWN;
+	case UET_VPP_CLIENT_STATUS_SLOT_BUSY:
+		return -EBUSY;
+	case UET_VPP_CLIENT_STATUS_NO_BUFFERS:
+		return -ENOBUFS;
+	default:
+		return -EPROTO;
+	}
+}
+
+static int nic_vpp_poll_tx(struct vpp_data *vdata, int *completion_error)
 {
 	uet_vpp_client_completion_t completions[UET_VPP_TX_BATCH_SIZE];
+	int error = 0;
 	int i, rc;
 
 	rc = uet_vpp_client_poll_batch(vdata->client, completions,
@@ -56,11 +77,40 @@ static int nic_vpp_progress_tx(struct vpp_data *vdata)
 	if (rc < 0)
 		return rc;
 	for (i = 0; i < rc; i++) {
-		if (completions[i].status != UET_VPP_CLIENT_STATUS_OK ||
-		    !vdata->tx_inflight)
-			return -EPROTO;
-		vdata->tx_inflight--;
+		int status_error =
+			nic_vpp_completion_error(completions[i].status);
+
+		if (vdata->tx_inflight)
+			vdata->tx_inflight--;
+		else if (!error)
+			error = -EPROTO;
+		if (!error && status_error)
+			error = status_error;
 	}
+	*completion_error = error;
+	return rc;
+}
+
+static int nic_vpp_progress_tx(struct vpp_data *vdata)
+{
+	int completion_error;
+	int rc;
+
+	rc = nic_vpp_poll_tx(vdata, &completion_error);
+	if (rc < 0)
+		return rc;
+	return completion_error ? completion_error : rc;
+}
+
+static int nic_vpp_release_pending_rx(struct vpp_data *vdata)
+{
+	int rc;
+
+	if (!vdata->rx_pending)
+		return 0;
+	rc = uet_vpp_client_release_rx(vdata->client, &vdata->pending_rx);
+	if (!rc)
+		vdata->rx_pending = false;
 	return rc;
 }
 
@@ -217,8 +267,9 @@ int nic_vpp_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
 	if (frame_length < nic->min_pkt_size)
 		frame_length = nic->min_pkt_size;
 	if (frame_length > pkt_buf_size) {
-		uet_vpp_client_release_rx(vdata->client, &vdata->pending_rx);
-		vdata->rx_pending = false;
+		rc = nic_vpp_release_pending_rx(vdata);
+		if (rc)
+			return rc;
 		return -EMSGSIZE;
 	}
 
@@ -238,39 +289,119 @@ int nic_vpp_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
 		offset += vdata->pending_rx.iov[i].length;
 	}
 
-	rc = uet_vpp_client_release_rx(vdata->client, &vdata->pending_rx);
-	vdata->rx_pending = false;
+	rc = nic_vpp_release_pending_rx(vdata);
 	if (rc)
 		return rc;
 	*rx_pkt_size = frame_length;
 	return 1;
 }
 
+static int nic_vpp_discard_rx(struct vpp_data *vdata)
+{
+	int rc;
+
+	if (!vdata->rx_pending) {
+		rc = uet_vpp_client_poll_rx(vdata->client, &vdata->pending_rx);
+		if (rc <= 0)
+			return rc;
+		vdata->rx_pending = true;
+	}
+	rc = nic_vpp_release_pending_rx(vdata);
+	return rc ? rc : 1;
+}
+
 void nic_vpp_finalize(struct uet_nic *nic)
 {
 	struct vpp_data *vdata = nic->nic_priv_data;
-	uint64_t deadline;
-	int rc;
+	uint64_t deadline = 0, now;
+	int close_error = -EBUSY;
+	int drain_error = 0;
+	bool timed = true;
 
 	if (!vdata)
 		return;
-	if (vdata->rx_pending) {
-		uet_vpp_client_release_rx(vdata->client, &vdata->pending_rx);
-		vdata->rx_pending = false;
+	if (nic_vpp_monotonic_ns(&now)) {
+		timed = false;
+		drain_error = -EIO;
+	} else {
+		deadline = now + UET_VPP_CLOSE_TIMEOUT_NS;
 	}
-	deadline = nic_vpp_monotonic_ns() + UET_VPP_CLOSE_TIMEOUT_NS;
-	while (vdata->tx_inflight && nic_vpp_monotonic_ns() < deadline) {
-		rc = nic_vpp_progress_tx(vdata);
-		if (rc < 0)
+	while (timed) {
+		int completion_error = 0;
+		bool progressed = false;
+		int rx_rc, tx_rc;
+
+		tx_rc = nic_vpp_poll_tx(vdata, &completion_error);
+		if (tx_rc < 0) {
+			drain_error = tx_rc;
 			break;
-		if (!rc)
+		}
+		if (tx_rc)
+			progressed = true;
+		if (completion_error && !drain_error)
+			drain_error = completion_error;
+
+		rx_rc = nic_vpp_discard_rx(vdata);
+		if (rx_rc > 0)
+			progressed = true;
+		else if (rx_rc < 0 && rx_rc != -EAGAIN) {
+			if (!drain_error)
+				drain_error = rx_rc;
+			break;
+		}
+
+		if (!vdata->tx_inflight && !vdata->rx_pending && rx_rc == 0) {
+			close_error = uet_vpp_client_close(vdata->client);
+			if (!close_error) {
+				vdata->client = NULL;
+				break;
+			}
+			if (close_error != -EBUSY)
+				break;
+		}
+
+		if (nic_vpp_monotonic_ns(&now)) {
+			if (!drain_error)
+				drain_error = -EIO;
+			break;
+		}
+		if (now >= deadline)
+			break;
+		if (!progressed)
 			usleep(50);
 	}
-	rc = uet_vpp_client_close(vdata->client);
-	if (rc)
-		UET_API_ERR("uet_vpp_client_close failed: %d", rc);
+	if (vdata->client) {
+		close_error = uet_vpp_client_close(vdata->client);
+		if (!close_error)
+			vdata->client = NULL;
+	}
+	if (drain_error)
+		UET_API_ERR("VPP channel drain failed: %d", drain_error);
+	if (close_error)
+		UET_API_ERR("uet_vpp_client_close failed: %d", close_error);
 	free(vdata);
 	nic->nic_priv_data = NULL;
+}
+
+static int nic_vpp_configure_mtu(struct uet_nic *nic,
+				 struct vpp_data *vdata)
+{
+	const char *text = getenv(UET_VPP_MTU);
+	unsigned long long mtu = UET_VPP_DEFAULT_MTU;
+	char *end = NULL;
+
+	if (text) {
+		errno = 0;
+		mtu = strtoull(text, &end, 10);
+		if (errno || end == text || *end != '\0' || text[0] == '-')
+			return -EINVAL;
+	}
+	if (mtu < nic->min_ip_pkt_size ||
+	    mtu > vdata->info.dma_buffer_data_size)
+		return -ERANGE;
+	nic->mtu = (size_t)mtu;
+	nic->max_pkt_size = nic->mtu + nic->l2_hdr_size;
+	return 0;
 }
 
 static int nic_vpp_parse_addresses(struct uet_nic *nic)
@@ -325,8 +456,14 @@ int nic_vpp_initialize(struct uet_nic *nic)
 	nic->min_pkt_size = UET_MIN_PKT_SIZE;
 	nic->l2_hdr_size = sizeof(struct ethhdr);
 	nic->min_ip_pkt_size = nic->min_pkt_size - nic->l2_hdr_size;
-	nic->mtu = vdata->info.dma_buffer_data_size;
-	nic->max_pkt_size = nic->mtu + nic->l2_hdr_size;
+	rc = nic_vpp_configure_mtu(nic, vdata);
+	if (rc) {
+		UET_API_ERR("%s must be between %zu and %u (default %u)",
+			    UET_VPP_MTU, nic->min_ip_pkt_size,
+			    vdata->info.dma_buffer_data_size,
+			    UET_VPP_DEFAULT_MTU);
+		goto err_finalize;
+	}
 	nic->sock_fd = -1;
 	snprintf(nic->network_type, sizeof(nic->network_type), "%s",
 		 UET_NETWORK_TYPE_VPP);

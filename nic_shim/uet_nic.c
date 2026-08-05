@@ -357,7 +357,11 @@ int uet_nic_initialize(struct uet_nic *nic)
 	/* get interface name from environment variable */
 	nic_shim = getenv(UET_NIC_SHIM);
 
-#if ENABLE_XDP
+#if ENABLE_VPP
+	/* The dedicated VPP build uses the VPP shim unless explicitly overridden. */
+	if (nic_shim == NULL)
+		nic_shim = "vpp";
+#elif ENABLE_XDP
 	/* for an XDP build, make its shim the default */
 	if (nic_shim == NULL)
 		nic_shim = "xdp";

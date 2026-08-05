@@ -244,10 +244,15 @@ Replace `2` with the desired number of senders.
 - **FI_PROVIDER_PATH** - Directory containing the external `libuet-fi.so`
   provider.
 - **UET_IFNAME** - The ifname of the interface to attach to.
-- **UET_NIC_SHIM** - [ `rawsock` | `xdp` | `af_xdp` ]. The external `uet`
-  provider accepts `af_xdp` as an alias for `xdp`.
+- **UET_NIC_SHIM** - [ `rawsock` | `xdp` | `af_xdp` | `vpp` ]. The external
+  `uet` provider accepts `af_xdp` as an alias for `xdp`; the `uet_vpp` binary
+  defaults to `vpp`.
 - **UET_ENGINE_LIBRARY** - Optional path overriding the engine selected by
   `UET_NIC_SHIM` when `libuet-fi.so` opens a fabric.
+- **UET_VPP_SEGMENT** - SSVM channel exported by the VPP UET plugin (required by the VPP shim).
+- **UET_VPP_DMA_SOCKET** - Unix socket used to receive the authorized VPP buffer-pool mapping (required by the VPP shim).
+- **UET_VPP_IPV4_ADDR** / **UET_VPP_IPV6_ADDR** - One or both local IP addresses used by the provider with the VPP shim.
+- **UET_VPP_MTU** - IP MTU exposed by the VPP shim (default=`1500`; cannot exceed the exported VPP buffer capacity).
 - **UET_PDS** - [ `sng` | `pds` ] (default=`sng` stop-n-go)
 - **UET_PDS_PER_PKT_ACK_ENB** - [ `0` | `1` ] (default=`0`)
 - **UET_PDS_ACK_TYPE** - [ `ack` | `ack_cc` | `ack_ccx` ] (default=`ack`)
