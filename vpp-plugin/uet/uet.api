@@ -1,0 +1,86 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+option version = "0.10.0";
+
+/** Enable or disable the per-worker UET dataplane. */
+autoreply define uet_enable_disable
+{
+  u32 client_index;
+  u32 context;
+  bool enable;
+};
+
+/** Create one external dataplane channel for each VPP worker. */
+autoreply define uet_svm_create
+{
+  u32 client_index;
+  u32 context;
+  string segment_name[64];
+  u32 queue_depth;
+};
+
+/** Delete the current per-worker SPSC channels. */
+autoreply define uet_svm_delete
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** Clear the counters maintained by the UET plugin workers. */
+autoreply define uet_clear_counters
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** Select the IPv4 and IPv6 FIB tables used by routed transmit. */
+autoreply define uet_tx_fib_set
+{
+  u32 client_index;
+  u32 context;
+  u32 ip4_table_id;
+  u32 ip6_table_id;
+};
+
+service {
+  rpc uet_worker_dump returns stream uet_worker_details;
+};
+
+/** Request one operational snapshot for every VPP worker. */
+define uet_worker_dump
+{
+  u32 client_index;
+  u32 context;
+};
+
+/** Operational state and counters for one UET worker channel. */
+define uet_worker_details
+{
+  u32 context;
+  u32 worker_index;
+  u32 thread_index;
+  bool enabled;
+  bool svm_attached;
+  bool provider_ready;
+  bool tx_configured;
+  u32 tx_ip4_table_id;
+  u32 tx_ip6_table_id;
+  u64 generation;
+  u32 queue_depth;
+  u32 tx_pending;
+  u32 tx_completions_pending;
+  u32 rx_pending;
+  u32 rx_release_pending;
+  u64 tx_requests;
+  u64 invalid_requests;
+  u64 tx_completion_ring_full;
+  u64 tx_packets;
+  u64 tx_bytes;
+  u64 tx_completions;
+  u64 rx_delivered;
+  u64 rx_ring_full;
+  u64 rx_bad_chain;
+  u64 rx_releases;
+  u64 rx_invalid_releases;
+  u64 rx_outstanding;
+};

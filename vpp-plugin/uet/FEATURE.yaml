@@ -1,0 +1,11 @@
+---
+name: Ultra Ethernet host dataplane
+maintainer: Jerome Tollet <jtollet@cisco.com>
+features:
+  - IPv4 and IPv6 local delivery for native UET and UET over UDP
+  - Per-worker lockless external-process channels
+  - Native VPP routing and adjacency resolution on transmit
+  - Shared-memory zero-copy buffer exchange
+description: "Host dataplane between VPP and an external UET/libfabric provider"
+state: experimental
+properties: [API, CLI, MULTITHREAD, STATS]
