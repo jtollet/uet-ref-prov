@@ -32,7 +32,7 @@ int main(int argc, char **argv)
 	struct fid_domain *domain = NULL;
 	struct fid_av *av = NULL;
 	struct fid_cq *cq = NULL;
-	struct fid_ep *ep = NULL;
+	struct fid_ep *ep = NULL, *ep2 = NULL, *ep3 = NULL;
 	struct fid_mr *mr = NULL;
 	struct fi_av_attr av_attr = { .type = FI_AV_TABLE, .count = 16 };
 	struct fi_eq_attr eq_attr = { .wait_obj = FI_WAIT_NONE };
@@ -41,7 +41,7 @@ int main(int argc, char **argv)
 		.format = FI_CQ_FORMAT_TAGGED,
 		.wait_obj = FI_WAIT_NONE,
 	};
-	struct uet_addr local_addr;
+	struct uet_addr local_addr, local_addr2, local_addr3;
 	size_t addrlen = sizeof(local_addr);
 	char buffer[4096];
 	int close_rc;
@@ -120,12 +120,57 @@ int main(int argc, char **argv)
 	if (check(rc, "fi_getname"))
 		goto out;
 
+	/* A single process may create several endpoints on the same fabric
+	 * address and PIDonFEP.  They must receive distinct Resource Indices.
+	 */
+	fprintf(stderr, "smoke: fi_endpoint(second)\n");
+	rc = fi_endpoint(domain, info, &ep2, NULL);
+	if (check(rc, "fi_endpoint(second)"))
+		goto out;
+	addrlen = sizeof(local_addr2);
+	rc = fi_getname(&ep2->fid, &local_addr2, &addrlen);
+	if (check(rc, "fi_getname(second)"))
+		goto out;
+	if (local_addr.pid_on_fep != local_addr2.pid_on_fep ||
+	    local_addr.start_index == local_addr2.start_index) {
+		fprintf(stderr,
+			"multi-endpoint address allocation failed: PID %u, RI %u/%u\n",
+			local_addr.pid_on_fep, local_addr.start_index,
+			local_addr2.start_index);
+		rc = -FI_EADDRINUSE;
+		goto out;
+	}
+
 	/* Exercise normal FI_MR_ENDPOINT cleanup before endpoint close. */
 	fprintf(stderr, "smoke: fi_close(MR)\n");
 	rc = fi_close(&mr->fid);
 	if (check(rc, "fi_close(MR)"))
 		goto out;
 	mr = NULL;
+
+	/* The engine waits for its close lifetime before removing the address.
+	 * Once close returns, the index may be allocated again without colliding
+	 * with the still-live second endpoint.
+	 */
+	fprintf(stderr, "smoke: fi_close(first EP)\n");
+	rc = fi_close(&ep->fid);
+	if (check(rc, "fi_close(first EP)"))
+		goto out;
+	ep = NULL;
+	fprintf(stderr, "smoke: fi_endpoint(reallocated)\n");
+	rc = fi_endpoint(domain, info, &ep3, NULL);
+	if (check(rc, "fi_endpoint(reallocated)"))
+		goto out;
+	addrlen = sizeof(local_addr3);
+	rc = fi_getname(&ep3->fid, &local_addr3, &addrlen);
+	if (check(rc, "fi_getname(reallocated)"))
+		goto out;
+	if (local_addr3.start_index != local_addr.start_index) {
+		fprintf(stderr, "closed Resource Index was not reused: %u != %u\n",
+			local_addr3.start_index, local_addr.start_index);
+		rc = -FI_EINVAL;
+		goto out;
+	}
 
 	rc = 0;
 
@@ -140,6 +185,16 @@ out:
 		close_rc = fi_close(&ep->fid);
 		if (close_rc && !rc)
 			rc = check(close_rc, "fi_close(EP)");
+	}
+	if (ep3) {
+		close_rc = fi_close(&ep3->fid);
+		if (close_rc && !rc)
+			rc = check(close_rc, "fi_close(reallocated EP)");
+	}
+	if (ep2) {
+		close_rc = fi_close(&ep2->fid);
+		if (close_rc && !rc)
+			rc = check(close_rc, "fi_close(second EP)");
 	}
 	if (cq) {
 		close_rc = fi_close(&cq->fid);
