@@ -26,7 +26,9 @@ extern "C"
   {
     uint16_t abi_major;
     uint16_t abi_minor;
+    uint32_t channel_count;
     uint32_t queue_depth;
+    /* Slot and ring depths below are per channel. */
     uint32_t dma_slot_count;
     uint32_t dma_buffer_data_size;
     uint64_t dma_map_size;
@@ -84,9 +86,10 @@ extern "C"
   } uet_vpp_client_completion_t;
 
   /*
-   * One client object is a lockless SPSC channel and has one owner thread.  It
-   * must not be called concurrently.  A future multithreaded provider should
-   * use one channel per progress owner rather than serialize this datapath.
+   * One client object owns one application segment containing one lockless
+   * SPSC channel per VPP worker.  Lifecycle calls must not overlap datapath
+   * calls.  A channel has one progress owner and must not be called
+   * concurrently; different channel indices may be used concurrently.
    *
    * Functions return 0 on success or a negative errno value, except poll(),
    * which returns 1 when a completion was consumed, 0 when the CQ is empty, or
@@ -97,25 +100,30 @@ extern "C"
   int uet_vpp_client_close (uet_vpp_client_t *client);
   int uet_vpp_client_map_dma (uet_vpp_client_t *client, const char *socket_path);
 
-  int uet_vpp_client_acquire_dma (uet_vpp_client_t *client, uint32_t *dma_slot, void **data,
-				  size_t *capacity);
-  int uet_vpp_client_release_dma (uet_vpp_client_t *client, uint32_t dma_slot);
-  int uet_vpp_client_submit_ip (uet_vpp_client_t *client, uint32_t dma_slot, uint32_t packet_length,
-				uint64_t request_id, uint64_t user_context);
-  int uet_vpp_client_submit_ip_batch (uet_vpp_client_t *client,
+  int uet_vpp_client_acquire_dma (uet_vpp_client_t *client, uint32_t channel_index,
+				  uint32_t *dma_slot, void **data, size_t *capacity);
+  int uet_vpp_client_release_dma (uet_vpp_client_t *client, uint32_t channel_index,
+				  uint32_t dma_slot);
+  int uet_vpp_client_submit_ip (uet_vpp_client_t *client, uint32_t channel_index, uint32_t dma_slot,
+				uint32_t packet_length, uint64_t request_id, uint64_t user_context);
+  int uet_vpp_client_submit_ip_batch (uet_vpp_client_t *client, uint32_t channel_index,
 				      const uet_vpp_client_tx_request_t *requests,
 				      size_t request_count);
-  int uet_vpp_client_poll (uet_vpp_client_t *client, uet_vpp_client_completion_t *completion);
-  int uet_vpp_client_poll_batch (uet_vpp_client_t *client, uet_vpp_client_completion_t *completions,
+  int uet_vpp_client_poll (uet_vpp_client_t *client, uint32_t channel_index,
+			   uet_vpp_client_completion_t *completion);
+  int uet_vpp_client_poll_batch (uet_vpp_client_t *client, uint32_t channel_index,
+				 uet_vpp_client_completion_t *completions,
 				 size_t completion_capacity);
-  int uet_vpp_client_poll_rx (uet_vpp_client_t *client, uet_vpp_client_rx_t *rx);
-  int uet_vpp_client_poll_rx_batch (uet_vpp_client_t *client, uet_vpp_client_rx_t *rx,
-				    size_t rx_capacity);
+  int uet_vpp_client_poll_rx (uet_vpp_client_t *client, uint32_t channel_index,
+			      uet_vpp_client_rx_t *rx);
+  int uet_vpp_client_poll_rx_batch (uet_vpp_client_t *client, uint32_t channel_index,
+				    uet_vpp_client_rx_t *rx, size_t rx_capacity);
 
   /* A polled RX must be released exactly once with its unchanged ID and token. */
-  int uet_vpp_client_release_rx (uet_vpp_client_t *client, const uet_vpp_client_rx_t *rx);
-  int uet_vpp_client_release_rx_batch (uet_vpp_client_t *client, const uet_vpp_client_rx_t *rx,
-				       size_t rx_count);
+  int uet_vpp_client_release_rx (uet_vpp_client_t *client, uint32_t channel_index,
+				 const uet_vpp_client_rx_t *rx);
+  int uet_vpp_client_release_rx_batch (uet_vpp_client_t *client, uint32_t channel_index,
+				       const uet_vpp_client_rx_t *rx, size_t rx_count);
 
 #ifdef __cplusplus
 }

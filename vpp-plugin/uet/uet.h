@@ -65,7 +65,7 @@ typedef struct
   u32 rx_free_count;
 
   u8 svm_attached;
-  ssvm_private_t svm_segment;
+  u8 dma_ready_ack;
   uet_vpp_svm_shared_header_t *svm_header;
 
   u32 *dma_buffer_indices;
@@ -106,7 +106,9 @@ typedef struct
   u32 rx_handoff_queue_indices[UET_RX_N_PATHS];
   u8 rx_entropy_handoff;
 
-  u8 *svm_base_name;
+  ssvm_private_t svm_segment;
+  uet_vpp_svm_shared_header_t *svm_header;
+  uet_vpp_svm_worker_channel_t *svm_channels;
   u32 svm_channel_count;
   u32 svm_queue_depth;
   u64 svm_generation;

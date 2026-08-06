@@ -532,9 +532,43 @@ uet_svm_process (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw)
   u32 client_flags;
 
   client_flags = clib_atomic_load_acq_n (&uw->svm_header->client_flags);
-  clib_atomic_store_rel_n (
-    &uw->svm_header->server_flags,
-    client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY ? UET_VPP_SVM_SERVER_F_DMA_READY_ACK : 0);
+  if (!!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY) != uw->dma_ready_ack)
+    {
+      if (client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY)
+	{
+	  u32 ready = clib_atomic_add_fetch (&uw->svm_header->server_dma_ready_count, 1);
+
+	  uw->dma_ready_ack = 1;
+	  if (ready == uw->svm_header->worker_count)
+	    clib_atomic_store_rel_n (&uw->svm_header->server_flags,
+				     UET_VPP_SVM_SERVER_F_DMA_READY_ACK);
+	}
+      else
+	{
+	  /* The client may have published its final RX releases immediately
+	   * before clearing DMA_READY. Consume them before acknowledging that
+	   * this worker no longer touches the old owner state.
+	   */
+	  for (u32 batch = 0;
+	       batch < (uw->dma_slot_count + UET_SPSC_MAX_BATCH - 1) / UET_SPSC_MAX_BATCH; batch++)
+	    {
+	      u32 consumer = clib_atomic_load_relax_n (&uw->rx_release_ring->consumer);
+	      u32 producer = clib_atomic_load_acq_n (&uw->rx_release_ring->producer);
+
+	      if (producer == consumer)
+		break;
+	      uet_rx_release_process (vm, uw);
+	    }
+	  u32 ready = clib_atomic_sub_fetch (&uw->svm_header->server_dma_ready_count, 1);
+
+	  uw->dma_ready_ack = 0;
+	  if (!ready)
+	    clib_atomic_store_rel_n (&uw->svm_header->server_flags, 0);
+	}
+    }
+
+  if (!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY))
+    return 0;
 
   uet_rx_release_process (vm, uw);
   uet_tx_process (vm, uw, tx_buffers, tx_nexts, tx_trace_ids, &n_tx);

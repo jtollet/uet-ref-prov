@@ -249,12 +249,9 @@ Replace `2` with the desired number of senders.
   defaults to `vpp`.
 - **UET_ENGINE_LIBRARY** - Optional path overriding the engine selected by
   `UET_NIC_SHIM` when `libuet-fi.so` opens a fabric.
-- **UET_VPP_SEGMENT** - SSVM channel exported by the VPP UET plugin. With
-  multiple channels, this is the base for `<base>-w0` through `<base>-wN-1`
-  (required by the VPP shim).
-- **UET_VPP_CHANNEL_COUNT** - Number of VPP worker channels opened by the VPP
-  shim (normally discovered from the segment base; optional override,
-  maximum=`256`).
+- **UET_VPP_SEGMENT** - SSVM segment exported by the VPP UET plugin. The
+  segment contains one independent SPSC channel per VPP worker (required by
+  the VPP shim).
 - **UET_VPP_DMA_SOCKET** - Unix socket used to receive the authorized VPP
   buffer-pool mapping (required by the VPP shim).
 - **UET_VPP_IPV4_ADDR** / **UET_VPP_IPV6_ADDR** - One or both local IP

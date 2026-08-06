@@ -75,12 +75,11 @@ export UET_IFNAME=ens4f0np0
 The peer runs the same application and provider. Its backend may be selected
 independently.
 
-With multiple VPP workers, set `UET_VPP_SEGMENT` to the base used by
-`uet svm create`. The engine discovers and opens `<base>-w0` through
-`<base>-wN-1`; `UET_VPP_CHANNEL_COUNT` can override discovery when an explicit
-count is operationally preferable. TX selects a stable channel from the IP
+With multiple VPP workers, set `UET_VPP_SEGMENT` to the name used by
+`uet svm create`. The engine maps that segment once and obtains its worker
+channel count from ABI metadata. TX selects a stable channel from the IP
 addresses and UET EV (native entropy value or UDP source port); RX polls the
-worker channels fairly. A literal single-worker segment preserves the existing
+worker channels fairly. A single-worker segment preserves the existing
 behavior.
 
 ## Tests

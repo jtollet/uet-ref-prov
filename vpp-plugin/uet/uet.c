@@ -147,6 +147,7 @@ static void
 uet_worker_shared_pointers_clear (uet_worker_t *uw)
 {
   uw->svm_header = 0;
+  uw->dma_ready_ack = 0;
   uw->dma_slots = 0;
   uw->tx_ring = 0;
   uw->tx_descs = 0;
@@ -161,33 +162,17 @@ uet_worker_shared_pointers_clear (uet_worker_t *uw)
   uw->rx_free_count = 0;
 }
 
-static void
-uet_svm_lock_fds_close (int *lock_fds)
-{
-  for (u32 i = 0; i < vec_len (lock_fds); i++)
-    close (lock_fds[i]);
-  vec_free (lock_fds);
-}
-
 static int
-uet_svm_channels_lock (uet_main_t *um, int **lock_fds)
+uet_svm_segment_lock (uet_main_t *um, int *lock_fd)
 {
   /* Keep new clients out from the readiness transition through shm_unlink. */
-  for (u32 worker = 0; worker < um->svm_channel_count; worker++)
+  *lock_fd = shm_open ((char *) um->svm_segment.name, O_RDWR, 0);
+  if (*lock_fd < 0 || flock (*lock_fd, LOCK_EX | LOCK_NB) < 0)
     {
-      u32 thread_index = vlib_get_worker_thread_index (worker);
-      uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
-      int fd = shm_open ((char *) uw->svm_segment.name, O_RDWR, 0);
-
-      if (fd < 0 || flock (fd, LOCK_EX | LOCK_NB) < 0)
-	{
-	  if (fd >= 0)
-	    close (fd);
-	  uet_svm_lock_fds_close (*lock_fds);
-	  *lock_fds = 0;
-	  return VNET_API_ERROR_INSTANCE_IN_USE;
-	}
-      vec_add1 (*lock_fds, fd);
+      if (*lock_fd >= 0)
+	close (*lock_fd);
+      *lock_fd = -1;
+      return VNET_API_ERROR_INSTANCE_IN_USE;
     }
   return 0;
 }
@@ -201,6 +186,8 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
   vlib_physmem_map_t *physmem_map;
   u32 worker_count = vlib_num_workers ();
   clib_error_t *error;
+  void *oldheap;
+  int rv;
 
   if (!worker_count)
     return VNET_API_ERROR_INVALID_WORKER;
@@ -247,6 +234,46 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
 
   um->svm_generation++;
 
+  um->svm_segment.name = format (0, "%s%c", segment_name, 0);
+  um->svm_segment.ssvm_size = (uword) UET_SVM_SEGMENT_BASE_SIZE * worker_count;
+  um->svm_segment.my_pid = getpid ();
+  if ((rv = ssvm_server_init (&um->svm_segment, SSVM_SEGMENT_SHM)))
+    {
+      vec_free (um->svm_segment.name);
+      clib_memset (&um->svm_segment, 0, sizeof (um->svm_segment));
+      goto create_failed;
+    }
+
+  oldheap = ssvm_push_heap (um->svm_segment.sh);
+  um->svm_header = clib_mem_alloc_aligned (sizeof (*um->svm_header), UET_VPP_SVM_SHARED_ALIGNMENT);
+  if (um->svm_header)
+    um->svm_channels = clib_mem_alloc_aligned (worker_count * sizeof (*um->svm_channels),
+					       UET_VPP_SVM_SHARED_ALIGNMENT);
+  ssvm_pop_heap (oldheap);
+  if (!um->svm_header || !um->svm_channels)
+    goto create_failed;
+
+  clib_memset (um->svm_header, 0, sizeof (*um->svm_header));
+  clib_memset (um->svm_channels, 0, worker_count * sizeof (*um->svm_channels));
+  um->svm_header->magic = UET_VPP_SVM_ABI_MAGIC;
+  um->svm_header->abi_major = UET_VPP_SVM_ABI_MAJOR;
+  um->svm_header->abi_minor = UET_VPP_SVM_ABI_MINOR;
+  um->svm_header->header_size = sizeof (*um->svm_header);
+  um->svm_header->capabilities = UET_VPP_SVM_REQUIRED_CAPABILITIES;
+  um->svm_header->queue_depth = queue_depth;
+  um->svm_header->worker_count = worker_count;
+  um->svm_header->segment_size = um->svm_segment.ssvm_size;
+  um->svm_header->generation = um->svm_generation;
+  um->svm_header->worker_channel_table_offset = (u8 *) um->svm_channels - (u8 *) um->svm_segment.sh;
+  um->svm_header->dma_map_size = um->dma_map_size;
+  um->svm_header->dma_buffer_data_size = um->dma_buffer_data_size;
+  um->svm_header->dma_buffer_pool_index = um->dma_buffer_pool_index;
+  um->svm_header->worker_channel_desc_size = sizeof (*um->svm_channels);
+  um->svm_header->tx_desc_size = sizeof (uet_vpp_svm_tx_desc_t);
+  um->svm_header->tx_completion_size = sizeof (uet_vpp_svm_tx_completion_t);
+  um->svm_header->rx_desc_size = sizeof (uet_vpp_svm_rx_desc_t);
+  um->svm_header->rx_release_size = sizeof (uet_vpp_svm_rx_release_t);
+
   for (u32 worker = 0; worker < worker_count; worker++)
     {
       uet_vpp_svm_dma_slot_t *shared_dma_slots = 0;
@@ -256,9 +283,8 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
       uet_vpp_svm_spsc_ring_t *shared_rx_release_ring = 0;
       u32 thread_index = vlib_get_worker_thread_index (worker);
       uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
+      uet_vpp_svm_worker_channel_t *channel = um->svm_channels + worker;
       u32 n_dma_alloc;
-      void *oldheap;
-      int rv;
 
       vec_validate (uw->dma_buffer_indices, queue_depth - 1);
       n_dma_alloc = vlib_buffer_alloc_from_pool (um->vlib_main, uw->dma_buffer_indices, queue_depth,
@@ -270,29 +296,9 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
 	  vec_free (uw->dma_buffer_indices);
 	  goto create_failed;
 	}
-
-      uw->svm_segment.name = worker_count == 1 ? format (0, "%s%c", segment_name, 0) :
-						 format (0, "%s-w%u%c", segment_name, worker, 0);
-      if (!uet_svm_name_is_valid ((char *) uw->svm_segment.name))
-	{
-	  vec_free (uw->svm_segment.name);
-	  clib_memset (&uw->svm_segment, 0, sizeof (uw->svm_segment));
-	  goto create_failed;
-	}
-      uw->svm_segment.ssvm_size = UET_SVM_SEGMENT_BASE_SIZE;
-      uw->svm_segment.my_pid = getpid ();
-      if ((rv = ssvm_server_init (&uw->svm_segment, SSVM_SEGMENT_SHM)))
-	{
-	  vec_free (uw->svm_segment.name);
-	  clib_memset (&uw->svm_segment, 0, sizeof (uw->svm_segment));
-	  goto create_failed;
-	}
-
-      oldheap = ssvm_push_heap (uw->svm_segment.sh);
-      uw->svm_header = clib_mem_alloc_aligned (sizeof (*uw->svm_header), CLIB_CACHE_LINE_BYTES);
-      if (uw->svm_header)
-	shared_dma_slots = clib_mem_alloc_aligned (queue_depth * sizeof (*shared_dma_slots),
-						   UET_VPP_SVM_SHARED_ALIGNMENT);
+      oldheap = ssvm_push_heap (um->svm_segment.sh);
+      shared_dma_slots = clib_mem_alloc_aligned (queue_depth * sizeof (*shared_dma_slots),
+						 UET_VPP_SVM_SHARED_ALIGNMENT);
       if (shared_dma_slots)
 	shared_tx_ring = clib_mem_alloc_aligned (tx_ring_size, UET_VPP_SVM_SHARED_ALIGNMENT);
       if (shared_tx_ring)
@@ -305,42 +311,26 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
 	  clib_mem_alloc_aligned (rx_release_ring_size, UET_VPP_SVM_SHARED_ALIGNMENT);
       ssvm_pop_heap (oldheap);
 
-      if (!uw->svm_header || !shared_dma_slots || !shared_tx_ring || !shared_tx_completion_ring ||
-	  !shared_rx_ring || !shared_rx_release_ring)
+      if (!shared_dma_slots || !shared_tx_ring || !shared_tx_completion_ring || !shared_rx_ring ||
+	  !shared_rx_release_ring)
 	goto create_failed;
 
-      clib_memset (uw->svm_header, 0, sizeof (*uw->svm_header));
       clib_memset (shared_dma_slots, 0, queue_depth * sizeof (*shared_dma_slots));
       clib_memset (shared_tx_ring, 0, tx_ring_size);
       clib_memset (shared_tx_completion_ring, 0, tx_completion_ring_size);
       clib_memset (shared_rx_ring, 0, rx_ring_size);
       clib_memset (shared_rx_release_ring, 0, rx_release_ring_size);
-      uw->svm_header->magic = UET_VPP_SVM_ABI_MAGIC;
-      uw->svm_header->abi_major = UET_VPP_SVM_ABI_MAJOR;
-      uw->svm_header->abi_minor = UET_VPP_SVM_ABI_MINOR;
-      uw->svm_header->header_size = sizeof (*uw->svm_header);
-      uw->svm_header->capabilities = UET_VPP_SVM_REQUIRED_CAPABILITIES;
-      uw->svm_header->queue_depth = queue_depth;
-      uw->svm_header->segment_size = uw->svm_segment.ssvm_size;
-      uw->svm_header->generation = um->svm_generation;
-      uw->svm_header->dma_slot_table_offset = (u8 *) shared_dma_slots - (u8 *) uw->svm_segment.sh;
-      uw->svm_header->dma_map_size = um->dma_map_size;
-      uw->svm_header->dma_slot_count = queue_depth;
-      uw->svm_header->dma_slot_desc_size = sizeof (*shared_dma_slots);
-      uw->svm_header->dma_buffer_data_size = um->dma_buffer_data_size;
-      uw->svm_header->dma_buffer_pool_index = um->dma_buffer_pool_index;
-      uw->svm_header->tx_ring_offset = (u8 *) shared_tx_ring - (u8 *) uw->svm_segment.sh;
-      uw->svm_header->tx_completion_ring_offset =
-	(u8 *) shared_tx_completion_ring - (u8 *) uw->svm_segment.sh;
-      uw->svm_header->tx_ring_size = queue_depth;
-      uw->svm_header->tx_desc_size = sizeof (uet_vpp_svm_tx_desc_t);
-      uw->svm_header->tx_completion_size = sizeof (uet_vpp_svm_tx_completion_t);
-      uw->svm_header->rx_ring_offset = (u8 *) shared_rx_ring - (u8 *) uw->svm_segment.sh;
-      uw->svm_header->rx_release_ring_offset =
-	(u8 *) shared_rx_release_ring - (u8 *) uw->svm_segment.sh;
-      uw->svm_header->rx_ring_size = queue_depth;
-      uw->svm_header->rx_desc_size = sizeof (uet_vpp_svm_rx_desc_t);
-      uw->svm_header->rx_release_size = sizeof (uet_vpp_svm_rx_release_t);
+      channel->worker_index = worker;
+      channel->thread_index = thread_index;
+      channel->dma_slot_table_offset = (u8 *) shared_dma_slots - (u8 *) um->svm_segment.sh;
+      channel->dma_slot_count = queue_depth;
+      channel->tx_ring_offset = (u8 *) shared_tx_ring - (u8 *) um->svm_segment.sh;
+      channel->tx_completion_ring_offset =
+	(u8 *) shared_tx_completion_ring - (u8 *) um->svm_segment.sh;
+      channel->tx_ring_size = queue_depth;
+      channel->rx_ring_offset = (u8 *) shared_rx_ring - (u8 *) um->svm_segment.sh;
+      channel->rx_release_ring_offset = (u8 *) shared_rx_release_ring - (u8 *) um->svm_segment.sh;
+      channel->rx_ring_size = queue_depth;
 
       shared_tx_ring->size = queue_depth;
       shared_tx_ring->mask = (queue_depth & (queue_depth - 1)) ? 0 : queue_depth - 1;
@@ -360,6 +350,7 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
 	}
 
       uw->dma_slots = shared_dma_slots;
+      uw->svm_header = um->svm_header;
       uw->tx_ring = shared_tx_ring;
       uw->tx_descs = (uet_vpp_svm_tx_desc_t *) (shared_tx_ring + 1);
       uw->tx_completion_ring = shared_tx_completion_ring;
@@ -368,8 +359,9 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
       uw->rx_descs = (uet_vpp_svm_rx_desc_t *) (shared_rx_ring + 1);
       uw->rx_release_ring = shared_rx_release_ring;
       uw->rx_release_entries = (uet_vpp_svm_rx_release_t *) (shared_rx_release_ring + 1);
-      uw->svm_segment.sh->opaque[0] = (void *) ((u8 *) uw->svm_header - (u8 *) uw->svm_segment.sh);
     }
+
+  um->svm_segment.sh->opaque[0] = (void *) ((u8 *) um->svm_header - (u8 *) um->svm_segment.sh);
 
   vlib_worker_thread_barrier_sync (um->vlib_main);
   for (u32 worker = 0; worker < worker_count; worker++)
@@ -395,18 +387,11 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
     }
   vlib_worker_thread_barrier_release (um->vlib_main);
 
-  um->svm_base_name = format (0, "%s%c", segment_name, 0);
   um->svm_channel_count = worker_count;
   um->svm_queue_depth = queue_depth;
-  for (u32 worker = 0; worker < worker_count; worker++)
-    {
-      u32 thread_index = vlib_get_worker_thread_index (worker);
-      uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
-
-      clib_atomic_store_rel_n (&uw->svm_segment.sh->ready, 1);
-    }
+  clib_atomic_store_rel_n (&um->svm_segment.sh->ready, 1);
   uet_log_notice ("created generation %llu with %u worker channels, queue depth %u, "
-		  "DMA map size %llu",
+		  "one SVM segment and DMA map size %llu",
 		  um->svm_generation, worker_count, queue_depth, um->dma_map_size);
   return 0;
 
@@ -416,13 +401,15 @@ create_failed:
       u32 thread_index = vlib_get_worker_thread_index (worker);
       uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
 
-      if (uw->svm_segment.sh)
-	ssvm_delete (&uw->svm_segment);
-      else
-	vec_free (uw->svm_segment.name);
-      clib_memset (&uw->svm_segment, 0, sizeof (uw->svm_segment));
       uet_worker_shared_pointers_clear (uw);
     }
+  if (um->svm_segment.sh)
+    ssvm_delete (&um->svm_segment);
+  else
+    vec_free (um->svm_segment.name);
+  clib_memset (&um->svm_segment, 0, sizeof (um->svm_segment));
+  um->svm_header = 0;
+  um->svm_channels = 0;
   uet_dma_buffers_free (um);
   uet_log_warn ("failed to create worker channels for generation %llu", um->svm_generation);
   return VNET_API_ERROR_SVM_SEGMENT_CREATE_FAIL;
@@ -521,23 +508,17 @@ int
 uet_svm_delete (void)
 {
   uet_main_t *um = &uet_main;
-  int *lock_fds = 0;
+  int lock_fd = -1;
   int rv;
 
   if (!um->svm_channel_count)
     return VNET_API_ERROR_NO_SUCH_ENTRY;
 
-  rv = uet_svm_channels_lock (um, &lock_fds);
+  rv = uet_svm_segment_lock (um, &lock_fd);
   if (rv)
     return rv;
 
-  for (u32 worker = 0; worker < um->svm_channel_count; worker++)
-    {
-      u32 thread_index = vlib_get_worker_thread_index (worker);
-      uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
-
-      clib_atomic_store_rel_n (&uw->svm_segment.sh->ready, 0);
-    }
+  clib_atomic_store_rel_n (&um->svm_segment.sh->ready, 0);
 
   vlib_worker_thread_barrier_sync (um->vlib_main);
   for (u32 worker = 0; worker < um->svm_channel_count; worker++)
@@ -552,17 +533,12 @@ uet_svm_delete (void)
     }
   vlib_worker_thread_barrier_release (um->vlib_main);
 
-  for (u32 worker = 0; worker < um->svm_channel_count; worker++)
-    {
-      u32 thread_index = vlib_get_worker_thread_index (worker);
-      uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
-
-      ssvm_delete (&uw->svm_segment);
-      clib_memset (&uw->svm_segment, 0, sizeof (uw->svm_segment));
-    }
-  uet_svm_lock_fds_close (lock_fds);
+  ssvm_delete (&um->svm_segment);
+  clib_memset (&um->svm_segment, 0, sizeof (um->svm_segment));
+  um->svm_header = 0;
+  um->svm_channels = 0;
+  close (lock_fd);
   uet_dma_buffers_free (um);
-  vec_free (um->svm_base_name);
   um->svm_channel_count = 0;
   um->svm_queue_depth = 0;
   uet_log_notice ("deleted external dataplane channels for generation %llu", um->svm_generation);
@@ -807,13 +783,11 @@ VLIB_CLI_COMMAND (uet_rx_placement_command, static) = {
 typedef struct
 {
   u32 thread_index;
-  u8 *segment_name;
+  u8 svm_attached;
   u64 tx_requests;
   u64 tx_packets;
   u64 rx_delivered;
   u64 rx_ring_full;
-  u32 owner_pid;
-  u8 provider_ready;
 } uet_cli_worker_snapshot_t;
 
 static clib_error_t *
@@ -832,7 +806,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   u32 rx_pending = 0, rx_release_pending = 0;
   u32 svm_attached = 0;
   u8 tx_configured = 0;
-  u32 provider_ready = 0;
+  u8 provider_ready = 0;
+  u32 owner_pid = 0;
   u32 worker_count = vlib_num_workers ();
   uet_vpp_svm_shared_header_t *first_header = 0;
   uet_cli_worker_snapshot_t *worker_snapshots = 0;
@@ -851,14 +826,11 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 	  uet_cli_worker_snapshot_t *snapshot = vec_elt_at_index (worker_snapshots, worker);
 
 	  snapshot->thread_index = thread_index;
-	  snapshot->segment_name = uw->svm_attached ? uw->svm_segment.name : 0;
+	  snapshot->svm_attached = uw->svm_attached;
 	  snapshot->tx_requests = uw->tx_requests;
 	  snapshot->tx_packets = uw->tx_packets;
 	  snapshot->rx_delivered = uw->rx_delivered;
 	  snapshot->rx_ring_full = uw->rx_ring_full;
-	  snapshot->owner_pid = 0;
-	  snapshot->provider_ready = 0;
-
 	  poll_calls += uw->poll_calls;
 	  tx_requests += uw->tx_requests;
 	  invalid_requests += uw->invalid_requests;
@@ -893,9 +865,13 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 	      u32 client_flags = clib_atomic_load_acq_n (&uw->svm_header->client_flags);
 	      u32 server_flags = clib_atomic_load_acq_n (&uw->svm_header->server_flags);
 
-	      snapshot->owner_pid = clib_atomic_load_acq_n (&uw->svm_header->owner_pid);
 	      if (!first_header)
-		first_header = uw->svm_header;
+		{
+		  first_header = uw->svm_header;
+		  owner_pid = clib_atomic_load_acq_n (&uw->svm_header->owner_pid);
+		  provider_ready = !!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY) &&
+				   !!(server_flags & UET_VPP_SVM_SERVER_F_DMA_READY_ACK);
+		}
 	      svm_attached++;
 	      tx_pending += clib_atomic_load_acq_n (&uw->tx_ring->producer) -
 			    clib_atomic_load_acq_n (&uw->tx_ring->consumer);
@@ -905,10 +881,6 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 			    clib_atomic_load_acq_n (&uw->rx_ring->consumer);
 	      rx_release_pending += clib_atomic_load_acq_n (&uw->rx_release_ring->producer) -
 				    clib_atomic_load_acq_n (&uw->rx_release_ring->consumer);
-	      provider_ready += !!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY) &&
-				!!(server_flags & UET_VPP_SVM_SERVER_F_DMA_READY_ACK);
-	      snapshot->provider_ready = !!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY) &&
-					 !!(server_flags & UET_VPP_SVM_SERVER_F_DMA_READY_ACK);
 	    }
 	}
       vlib_worker_thread_barrier_release (vm);
@@ -963,16 +935,18 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 								  "detached");
   if (first_header)
     {
-      vlib_cli_output (vm, "svm-segment %s", um->svm_base_name);
+      vlib_cli_output (vm, "svm-segment %s", um->svm_segment.name);
       vlib_cli_output (vm, "svm-channels %u", um->svm_channel_count);
       vlib_cli_output (vm, "svm-abi %u.%u", first_header->abi_major, first_header->abi_minor);
       vlib_cli_output (vm, "svm-generation %llu", first_header->generation);
       vlib_cli_output (vm, "svm-queue-depth %u", first_header->queue_depth);
-      vlib_cli_output (vm, "svm-dma-slot-count %u", first_header->dma_slot_count);
+      vlib_cli_output (vm, "svm-dma-slot-count %u",
+		       first_header->queue_depth * first_header->worker_count);
       vlib_cli_output (vm, "svm-dma-buffer-data-size %u", first_header->dma_buffer_data_size);
       vlib_cli_output (vm, "svm-dma-map-size %llu", first_header->dma_map_size);
       vlib_cli_output (vm, "svm-dma-socket %s", um->dma_socket_name);
-      vlib_cli_output (vm, "provider-ready %s", provider_ready == worker_count ? "yes" : "no");
+      vlib_cli_output (vm, "provider-ready %s", provider_ready ? "yes" : "no");
+      vlib_cli_output (vm, "provider-owner-pid %u", owner_pid);
       vlib_cli_output (vm, "tx-pending %u", tx_pending);
       vlib_cli_output (vm, "tx-completions-pending %u", tx_completions_pending);
       vlib_cli_output (vm, "rx-pending %u", rx_pending);
@@ -985,11 +959,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 
       vlib_cli_output (vm, "worker-%u-thread %U", worker, format_vlib_thread_name_and_index,
 		       snapshot->thread_index);
-      vlib_cli_output (vm, "worker-%u-segment %s", worker,
-		       snapshot->segment_name ? snapshot->segment_name : (u8 *) "detached");
-      vlib_cli_output (vm, "worker-%u-provider-ready %s", worker,
-		       snapshot->provider_ready ? "yes" : "no");
-      vlib_cli_output (vm, "worker-%u-owner-pid %u", worker, snapshot->owner_pid);
+      vlib_cli_output (vm, "worker-%u-channel %s", worker,
+		       snapshot->svm_attached ? "attached" : "detached");
       vlib_cli_output (vm, "worker-%u-tx-requests %llu", worker, snapshot->tx_requests);
       vlib_cli_output (vm, "worker-%u-tx-packets %llu", worker, snapshot->tx_packets);
       vlib_cli_output (vm, "worker-%u-rx-delivered %llu", worker, snapshot->rx_delivered);

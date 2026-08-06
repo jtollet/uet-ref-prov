@@ -118,7 +118,7 @@ grep -q '^state enabled$' <<<"$status"
 grep -q '^owner-worker .* (1)$' <<<"$status"
 grep -q '^svm-state attached$' <<<"$status"
 grep -q "^svm-segment $segment_name$" <<<"$status"
-grep -q '^svm-abi 3\.1$' <<<"$status"
+grep -q '^svm-abi 4\.0$' <<<"$status"
 grep -q "^svm-queue-depth $queue_depth$" <<<"$status"
 grep -q "^svm-dma-slot-count $queue_depth$" <<<"$status"
 grep -Eq '^svm-dma-buffer-data-size [1-9][0-9]*$' <<<"$status"
@@ -177,7 +177,7 @@ if ! "${cli[@]}" show uet | tr -d '\r' | grep -q '^provider-ready yes$'; then
   exit 1
 fi
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-busy
-"${cli[@]}" show uet | tr -d '\r' | grep -q "^worker-0-owner-pid $negative_pid$"
+"${cli[@]}" show uet | tr -d '\r' | grep -q "^provider-owner-pid $negative_pid$"
 "${cli[@]}" packet-generator enable-stream uet-rx
 if ! wait "$negative_pid"; then
   negative_pid=
@@ -205,12 +205,12 @@ grep -q '^dma-authorized-clients 1$' <<<"$status"
 grep -q '^dma-rejected-clients 0$' <<<"$status"
 grep -q '^tx-pending 0$' <<<"$status"
 grep -q '^tx-completions-pending 0$' <<<"$status"
-grep -q '^worker-0-owner-pid 0$' <<<"$status"
+grep -q '^provider-owner-pid 0$' <<<"$status"
 
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-double-busy
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-existing-heap
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-success
-"${cli[@]}" show uet | tr -d '\r' | grep -q '^worker-0-owner-pid 0$'
+"${cli[@]}" show uet | tr -d '\r' | grep -q '^provider-owner-pid 0$'
 
 "${cli[@]}" clear uet counters
 
@@ -254,7 +254,7 @@ for _ in $(seq 1 100); do
   sleep 0.01
 done
 grep -q '^owner ready:' "$runtime_dir/owner-probe.log"
-"${cli[@]}" show uet | tr -d '\r' | grep -q "^worker-0-owner-pid $owner_probe_pid$"
+"${cli[@]}" show uet | tr -d '\r' | grep -q "^provider-owner-pid $owner_probe_pid$"
 "${cli[@]}" packet-generator enable-stream uet-crash-rx
 for _ in $(seq 1 100); do
   "${cli[@]}" show uet | tr -d '\r' | grep -q '^rx-outstanding 1$' && break
@@ -270,7 +270,7 @@ kill -KILL "$owner_probe_pid"
 wait "$owner_probe_pid" 2>/dev/null || true
 owner_probe_pid=
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-owner-dead
-"${cli[@]}" show uet | tr -d '\r' | grep -q "^worker-0-owner-pid $dead_owner_pid$"
+"${cli[@]}" show uet | tr -d '\r' | grep -q "^provider-owner-pid $dead_owner_pid$"
 
 delete_reply=$("${vat2[@]}" uet_svm_delete '{}')
 printf '%s\n' "$delete_reply"
@@ -282,7 +282,7 @@ create_reply=$("${vat2[@]}" uet_svm_create \
 printf '%s\n' "$create_reply"
 grep -Eq '"retval":[[:space:]]*0' <<<"$create_reply"
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-success
-"${cli[@]}" show uet | tr -d '\r' | grep -q '^worker-0-owner-pid 0$'
+"${cli[@]}" show uet | tr -d '\r' | grep -q '^provider-owner-pid 0$'
 delete_reply=$("${vat2[@]}" uet_svm_delete '{}')
 printf '%s\n' "$delete_reply"
 grep -Eq '"retval":[[:space:]]*0' <<<"$delete_reply"

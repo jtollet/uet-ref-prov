@@ -31,16 +31,9 @@ api_prefix="uet-multiworker-$$"
 segment_name="uet-multiworker-$$"
 tx_packet_count=${UET_TX_SMOKE_PACKETS:-1024}
 vpp_pid=
-client_pids=()
 
 cleanup()
 {
-  for pid in "${client_pids[@]}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
-  done
   if [[ -n "$vpp_pid" ]] && kill -0 "$vpp_pid" 2>/dev/null; then
     kill "$vpp_pid"
     wait "$vpp_pid" 2>/dev/null || true
@@ -89,26 +82,13 @@ grep -q '^rx-placement entropy-handoff$' <<<"$("${cli[@]}" show uet | tr -d '\r'
 "${cli[@]}" uet svm create name "$segment_name" queue-size 256
 
 library_path="$plugin_build_dir/lib:$vpp_prefix/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-for ((worker = 0; worker < worker_count; worker++)); do
-  if (( worker_count == 1 )); then
-    channel_name=$segment_name
-  else
-    channel_name="$segment_name-w$worker"
-  fi
-  env LD_LIBRARY_PATH="$library_path" \
-    "$tx_client_bin" "$channel_name" "$tx_packet_count" "$runtime_dir/uet-dma.sock" \
-    >"$runtime_dir/tx-client-$worker.log" 2>&1 &
-  client_pids+=("$!")
-done
-
-for ((worker = 0; worker < worker_count; worker++)); do
-  if ! wait "${client_pids[$worker]}"; then
-    cat "$runtime_dir/tx-client-$worker.log" >&2
-    exit 1
-  fi
-  cat "$runtime_dir/tx-client-$worker.log"
-done
-client_pids=()
+if ! env LD_LIBRARY_PATH="$library_path" \
+  "$tx_client_bin" "$segment_name" "$tx_packet_count" "$runtime_dir/uet-dma.sock" \
+  >"$runtime_dir/tx-client.log" 2>&1; then
+  cat "$runtime_dir/tx-client.log" >&2
+  exit 1
+fi
+cat "$runtime_dir/tx-client.log"
 
 status=$("${cli[@]}" show uet | tr -d '\r')
 printf '%s\n' "$status"
@@ -118,15 +98,10 @@ grep -q "^tx-requests $((worker_count * tx_packet_count))$" <<<"$status"
 grep -q '^invalid-requests 0$' <<<"$status"
 grep -q "^tx-packets $((worker_count * tx_packet_count))$" <<<"$status"
 grep -q "^tx-completions $((worker_count * tx_packet_count))$" <<<"$status"
-grep -q "^dma-authorized-clients $worker_count$" <<<"$status"
+grep -q '^dma-authorized-clients 1$' <<<"$status"
 grep -q '^dma-rejected-clients 0$' <<<"$status"
 for ((worker = 0; worker < worker_count; worker++)); do
-  if (( worker_count == 1 )); then
-    channel_name=$segment_name
-  else
-    channel_name="$segment_name-w$worker"
-  fi
-  grep -q "^worker-$worker-segment $channel_name$" <<<"$status"
+  grep -q "^worker-$worker-channel attached$" <<<"$status"
   grep -q "^worker-$worker-tx-requests $tx_packet_count$" <<<"$status"
   grep -q "^worker-$worker-tx-packets $tx_packet_count$" <<<"$status"
 done

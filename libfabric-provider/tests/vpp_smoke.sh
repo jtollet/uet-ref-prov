@@ -109,9 +109,7 @@ env \
 
 status=$("$vpp_prefix/bin/vppctl" -s "$runtime_dir/cli.sock" show uet | tr -d '\r')
 grep -q "^svm-channels $worker_count$" <<<"$status"
-grep -q "^dma-authorized-clients $worker_count$" <<<"$status"
-for ((worker = 0; worker < worker_count; worker++)); do
-  grep -q "^worker-$worker-owner-pid 0$" <<<"$status"
-done
+grep -q '^dma-authorized-clients 1$' <<<"$status"
+grep -q '^provider-owner-pid 0$' <<<"$status"
 
 echo "UET libfabric provider VPP $worker_count-channel smoke test passed; logs: $runtime_dir"

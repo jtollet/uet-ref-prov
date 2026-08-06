@@ -86,24 +86,24 @@ Each worker owns its rings, buffer ownership, TX completion state, RX release
 state, counters, and eventually its UET PDC/timer state. There is no mutex in
 the datapath and no SPSC ring is shared between workers.
 
-For one worker, the SSVM segment uses the configured base name. For multiple
-workers, the segments are named `<base>-w0` through `<base>-wN-1`. One
-`libuet_vpp_client` object represents one SPSC channel. The VPP NIC engine
-opens all worker objects when `UET_VPP_CHANNEL_COUNT` is greater than one and
-serializes each independently, so unrelated channels do not share a datapath
-mutex. All worker channels export the same physical VPP buffer pool and
-currently must be on the same NUMA node.
+One SSVM segment uses the configured name and represents one provider process.
+It contains one independent SPSC channel per VPP worker. One
+`libuet_vpp_client` object maps that segment and the common VPP buffer pool
+once; datapath calls select a channel index. Each channel has one progress
+owner, while different channels can be used concurrently without an internal
+datapath mutex. All worker channels currently use the same physical VPP buffer
+pool and must be on the same NUMA node.
 
-`libuet_vpp_client_open()` takes a non-blocking exclusive lock on the channel's
+`libuet_vpp_client_open()` takes a non-blocking exclusive lock on the segment's
 SHM object before SSVM attaches. A second opener, whether it is another process
 or a second open in the same process, receives `-EBUSY` and cannot overwrite
 the active channel owner. The lock and the shared owner PID are released by a
 clean close. The kernel releases the lock if the process exits, but the owner
 PID deliberately remains set: a later open returns `-EOWNERDEAD`, because
 rings and VPP-buffer ownership may have been left in an indeterminate state.
-Delete and recreate the SVM channels before attaching a replacement provider
+Delete and recreate the SVM segment before attaching a replacement provider
 after such a crash.
-VPP refuses to delete a channel whose owner process is still alive.
+VPP refuses to delete a segment whose owner process is still alive.
 
 VPP Session Layer and VCL are intentionally absent. The external application
 communicates through SSVM metadata plus shared VPP physmem. The main thread is
@@ -111,25 +111,26 @@ sufficient for serialized control only because configuration callbacks run on
 that thread and use worker barriers; it is not used to serialize datapath
 access.
 
-## Shared ABI 3.1
+## Shared ABI 4.0
 
 The ABI is defined in [`uet/svm_abi.h`](uet/svm_abi.h). Structures use fixed
 width fields and offsets from a mapping base; process pointers never cross the
 boundary. A major version mismatch is rejected. New trailing fields require a
 minor version bump.
 
-ABI 3.1 contains only the production SPSC dataplane:
+ABI 4.0 contains only the production SPSC dataplane:
 
 - lockless TX and TX-completion rings;
 - a lockless RX descriptor ring and RX-release ring;
 - a VPP physmem file descriptor passed over a Unix `SOCK_SEQPACKET` socket;
-- a provider-ready/server-ack handshake that makes DMA unmapping safe;
+- a provider-ready handshake counted across all workers, which makes DMA
+  unmapping safe;
 - an exclusive owner PID, backed by a lifetime SHM lock rather than a datapath
   mutex.
 
 The experimental `svm_msg_q` request path, payload verifier and fixed SSVM
 payload pool present in ABI 2.x have been removed. SSVM remains responsible
-for creating and mapping each channel; it no longer carries packet data or a
+for creating and mapping the channel set; it no longer carries packet data or a
 second request/completion protocol.
 
 The TX pool starts with one VLIB buffer per shared slot. The client
@@ -158,7 +159,7 @@ duplicate releases before publishing them.
 The Unix-socket filesystem permissions are the first authorization boundary.
 Before passing the physmem file descriptor, the plugin also reads the
 kernel-supplied `SO_PEERCRED` identity and requires the peer PID to match the
-exclusive owner PID in one ready SSVM worker channel. The client must therefore
+exclusive owner PID in the ready SSVM segment. The client must therefore
 attach its SSVM segment before requesting the DMA mapping. A process that
 merely knows the socket path receives `-EACCES` without an `SCM_RIGHTS`
 descriptor; accepted and rejected attempts are visible in `show uet`.
@@ -184,7 +185,7 @@ The zero-copy boundaries are therefore:
 
 The client still uses VPP's SSVM attach API and must be built against a
 compatible VPP SDK. The packet-channel layout itself is defined by
-`uet/svm_abi.h` and checked as ABI 3.1 when a client opens a channel. The
+`uet/svm_abi.h` and checked as ABI 4.0 when a client opens a channel set. The
 plugin also declares the required `VPP_BUILD_VER`, so VPP rejects an
 incompatible binary at load time.
 
@@ -274,9 +275,9 @@ vpp-plugin/tests/reject-invalid-worker-count.sh /opt/vpp build/vpp-plugin 2
 vpp-plugin/tests/smoke-svm.sh /opt/vpp build/vpp-plugin 2 3
 ```
 
-`smoke-multiworker.sh` has been validated with 1, 2, 4, and 8 workers. It
-opens one external client per channel and verifies independent request and
-completion progress plus routed TX buffer replacement on every worker.
+`smoke-multiworker.sh` has been validated with 1, 2, 4, and 8 workers. It opens
+one external client for the common segment and verifies independent request
+and completion progress plus routed TX buffer replacement on every worker.
 
 `smoke-svm.sh` also connects an unattached process to the DMA socket and
 verifies that it receives `-EACCES` and no file descriptor before exercising
@@ -291,7 +292,7 @@ and stale releases without publishing them. The default queue depth of 257
 exercises modulo-based SPSC indexing; set `UET_SVM_QUEUE_DEPTH=256` to exercise
 the power-of-two mask path. The test also verifies that a concurrent attach is
 rejected, that a clean close releases ownership, and that a crashed owner is
-reported as `-EOWNERDEAD` until the SVM channel is recreated.
+reported as `-EOWNERDEAD` until the SVM segment is recreated.
 
 ## Companion hardware validation and performance
 

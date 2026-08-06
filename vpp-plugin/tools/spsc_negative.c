@@ -11,7 +11,7 @@
 
 #include <uet_vpp_client.h>
 
-#define UET_SPSC_NEGATIVE_WAIT_NS (500ULL * 1000 * 1000)
+#define UET_SPSC_NEGATIVE_WAIT_NS    (500ULL * 1000 * 1000)
 #define UET_SPSC_NEGATIVE_TIMEOUT_NS (2ULL * 1000 * 1000 * 1000)
 
 static uint64_t
@@ -68,7 +68,7 @@ rx_ownership_check (uet_vpp_client_t *client, uint32_t rx_count, uint32_t ring_s
 
   while (n_received < rx_count && monotonic_ns () < deadline)
     {
-      rc = uet_vpp_client_poll_rx_batch (client, received + n_received, rx_count - n_received);
+      rc = uet_vpp_client_poll_rx_batch (client, 0, received + n_received, rx_count - n_received);
       if (rc < 0)
 	break;
       if (rc == 0)
@@ -99,22 +99,23 @@ rx_ownership_check (uet_vpp_client_t *client, uint32_t rx_count, uint32_t ring_s
   forged.rx_id ^= UINT64_C (1) << 63;
   if (!forged.rx_id)
     forged.rx_id = 1;
-  if (expect_result ("forged RX ID release", uet_vpp_client_release_rx (client, &forged), -EINVAL))
+  if (expect_result ("forged RX ID release", uet_vpp_client_release_rx (client, 0, &forged),
+		     -EINVAL))
     goto failed;
 
   forged = received[0];
   forged.release_token = (forged.release_token + 1) % ring_size;
-  if (expect_result ("forged RX token release", uet_vpp_client_release_rx (client, &forged),
+  if (expect_result ("forged RX token release", uet_vpp_client_release_rx (client, 0, &forged),
 		     -EINVAL))
     goto failed;
 
   duplicate[0] = received[0];
   duplicate[1] = received[0];
   if (expect_result ("duplicate RX release batch",
-		     uet_vpp_client_release_rx_batch (client, duplicate, 2), -EINVAL) ||
+		     uet_vpp_client_release_rx_batch (client, 0, duplicate, 2), -EINVAL) ||
       expect_result ("valid RX release batch",
-		     uet_vpp_client_release_rx_batch (client, received, rx_count), 0) ||
-      expect_result ("stale RX release", uet_vpp_client_release_rx (client, received), -EINVAL))
+		     uet_vpp_client_release_rx_batch (client, 0, received, rx_count), 0) ||
+      expect_result ("stale RX release", uet_vpp_client_release_rx (client, 0, received), -EINVAL))
     goto failed;
 
   free (received);
@@ -179,8 +180,8 @@ main (int argc, char **argv)
       goto done;
     }
   if (expect_result ("acquire before DMA map",
-		     uet_vpp_client_acquire_dma (client, &slot, &data, &capacity), -ENXIO) ||
-      expect_result ("RX poll before DMA map", uet_vpp_client_poll_rx (client, &rx), -ENXIO))
+		     uet_vpp_client_acquire_dma (client, 0, &slot, &data, &capacity), -ENXIO) ||
+      expect_result ("RX poll before DMA map", uet_vpp_client_poll_rx (client, 0, &rx), -ENXIO))
     goto done;
 
   rc = uet_vpp_client_map_dma (client, argv[2]);
@@ -191,24 +192,25 @@ main (int argc, char **argv)
     }
   if (expect_result ("duplicate DMA map", uet_vpp_client_map_dma (client, argv[2]), -EALREADY) ||
       expect_result ("out-of-range release",
-		     uet_vpp_client_release_dma (client, info.dma_slot_count), -EINVAL) ||
-      expect_result ("unowned submit", uet_vpp_client_submit_ip (client, 0, 20, 1, 0), -EPERM) ||
-      expect_result ("unowned release", uet_vpp_client_release_dma (client, 0), -EPERM) ||
-      expect_result ("unowned RX release", uet_vpp_client_release_rx (client, &rx), -EINVAL))
+		     uet_vpp_client_release_dma (client, 0, info.dma_slot_count), -EINVAL) ||
+      expect_result ("unowned submit", uet_vpp_client_submit_ip (client, 0, 0, 20, 1, 0), -EPERM) ||
+      expect_result ("unowned release", uet_vpp_client_release_dma (client, 0, 0), -EPERM) ||
+      expect_result ("unowned RX release", uet_vpp_client_release_rx (client, 0, &rx), -EINVAL))
     goto done;
 
-  rc = uet_vpp_client_acquire_dma (client, &slot, &data, &capacity);
+  rc = uet_vpp_client_acquire_dma (client, 0, &slot, &data, &capacity);
   if (rc)
     {
       fprintf (stderr, "DMA acquisition failed: %d\n", rc);
       goto done;
     }
-  if (expect_result ("undersized IP submit", uet_vpp_client_submit_ip (client, slot, 19, 2, 0),
+  if (expect_result ("undersized IP submit", uet_vpp_client_submit_ip (client, 0, slot, 19, 2, 0),
 		     -EMSGSIZE) ||
-      expect_result ("release after rejected submit", uet_vpp_client_release_dma (client, slot), 0))
+      expect_result ("release after rejected submit", uet_vpp_client_release_dma (client, 0, slot),
+		     0))
     goto done;
 
-  rc = uet_vpp_client_acquire_dma (client, &slot, &data, &capacity);
+  rc = uet_vpp_client_acquire_dma (client, 0, &slot, &data, &capacity);
   if (rc || capacity < 20)
     {
       fprintf (stderr, "DMA acquisition for duplicate batch failed: %d\n", rc);
@@ -223,12 +225,13 @@ main (int argc, char **argv)
   };
   duplicate[1] = duplicate[0];
   duplicate[1].request_id++;
-  if (expect_result ("duplicate-slot batch", uet_vpp_client_submit_ip_batch (client, duplicate, 2),
-		     -EINVAL) ||
-      expect_result ("release after rejected batch", uet_vpp_client_release_dma (client, slot), 0))
+  if (expect_result ("duplicate-slot batch",
+		     uet_vpp_client_submit_ip_batch (client, 0, duplicate, 2), -EINVAL) ||
+      expect_result ("release after rejected batch", uet_vpp_client_release_dma (client, 0, slot),
+		     0))
     goto done;
 
-  rc = uet_vpp_client_acquire_dma (client, &slot, &data, &capacity);
+  rc = uet_vpp_client_acquire_dma (client, 0, &slot, &data, &capacity);
   if (rc || capacity < 20)
     {
       fprintf (stderr, "DMA acquisition for malformed packet failed: %d\n", rc);
@@ -241,24 +244,25 @@ main (int argc, char **argv)
     .request_id = 5,
     .user_context = 0x55,
   };
-  if (expect_result ("malformed IP submit", uet_vpp_client_submit_ip_batch (client, duplicate, 1),
-		     0) ||
+  if (expect_result ("malformed IP submit",
+		     uet_vpp_client_submit_ip_batch (client, 0, duplicate, 1), 0) ||
       expect_result ("close with TX in flight", uet_vpp_client_close (client), -EBUSY) ||
-      expect_result ("release with TX in flight", uet_vpp_client_release_dma (client, slot),
+      expect_result ("release with TX in flight", uet_vpp_client_release_dma (client, 0, slot),
 		     -EPERM))
     goto done;
 
   deadline = monotonic_ns () + UET_SPSC_NEGATIVE_TIMEOUT_NS;
   do
     {
-      rc = uet_vpp_client_poll (client, &completion);
+      rc = uet_vpp_client_poll (client, 0, &completion);
       if (rc == 0)
 	sched_yield ();
     }
   while (rc == 0 && monotonic_ns () < deadline);
   if (rc != 1 || completion_check (&completion, duplicate))
     goto done;
-  if (expect_result ("release after completion", uet_vpp_client_release_dma (client, slot), -EPERM))
+  if (expect_result ("release after completion", uet_vpp_client_release_dma (client, 0, slot),
+		     -EPERM))
     goto done;
 
   requests = calloc (info.queue_depth, sizeof (*requests));
@@ -270,7 +274,7 @@ main (int argc, char **argv)
     }
   for (uint32_t i = 0; i < info.queue_depth; i++)
     {
-      rc = uet_vpp_client_acquire_dma (client, &slot, &data, &capacity);
+      rc = uet_vpp_client_acquire_dma (client, 0, &slot, &data, &capacity);
       if (rc || capacity < 20)
 	{
 	  fprintf (stderr, "DMA pool exhaustion setup failed at slot %u: %d\n", i, rc);
@@ -286,16 +290,16 @@ main (int argc, char **argv)
     }
   if (expect_result (
 	"DMA slot exhaustion",
-	uet_vpp_client_acquire_dma (client, &unused_slot, &unused_data, &unused_capacity),
+	uet_vpp_client_acquire_dma (client, 0, &unused_slot, &unused_data, &unused_capacity),
 	-EAGAIN) ||
       expect_result ("full-depth TX batch",
-		     uet_vpp_client_submit_ip_batch (client, requests, info.queue_depth), 0) ||
+		     uet_vpp_client_submit_ip_batch (client, 0, requests, info.queue_depth), 0) ||
       expect_result ("close with full-depth TX batch", uet_vpp_client_close (client), -EBUSY))
     goto done;
 
   while (nanosleep (&wait_time, &wait_time) != 0 && errno == EINTR)
     ;
-  rc = uet_vpp_client_poll_batch (client, completions, info.queue_depth);
+  rc = uet_vpp_client_poll_batch (client, 0, completions, info.queue_depth);
   if (rc != (int) info.queue_depth)
     {
       fprintf (stderr, "completion ring returned %d entries, expected %u\n", rc, info.queue_depth);

@@ -7,30 +7,32 @@
 #include <stdint.h>
 
 #define UET_VPP_SVM_ABI_MAGIC 0x53544555U
-#define UET_VPP_SVM_ABI_MAJOR 3
-#define UET_VPP_SVM_ABI_MINOR 1
+#define UET_VPP_SVM_ABI_MAJOR 4
+#define UET_VPP_SVM_ABI_MINOR 0
 
 #define UET_VPP_SVM_DEFAULT_QUEUE_DEPTH 256
-#define UET_VPP_SVM_MIN_QUEUE_DEPTH 8
-#define UET_VPP_SVM_MAX_QUEUE_DEPTH 4096
-#define UET_VPP_SVM_SHARED_ALIGNMENT 64
-#define UET_VPP_SVM_INVALID_DMA_SLOT UINT32_MAX
+#define UET_VPP_SVM_MIN_QUEUE_DEPTH	8
+#define UET_VPP_SVM_MAX_QUEUE_DEPTH	4096
+#define UET_VPP_SVM_SHARED_ALIGNMENT	64
+#define UET_VPP_SVM_INVALID_DMA_SLOT	UINT32_MAX
 
-#define UET_VPP_SVM_CAP_DMA_SLOTS (1U << 0)
-#define UET_VPP_SVM_CAP_TX_SPSC (1U << 1)
-#define UET_VPP_SVM_CAP_RX_SPSC (1U << 2)
-#define UET_VPP_SVM_CAP_TX_GRAPH_COMPLETION (1U << 3)
-#define UET_VPP_SVM_CAP_EXCLUSIVE_OWNER (1U << 4)
+#define UET_VPP_SVM_CAP_DMA_SLOTS	     (1U << 0)
+#define UET_VPP_SVM_CAP_TX_SPSC		     (1U << 1)
+#define UET_VPP_SVM_CAP_RX_SPSC		     (1U << 2)
+#define UET_VPP_SVM_CAP_TX_GRAPH_COMPLETION  (1U << 3)
+#define UET_VPP_SVM_CAP_EXCLUSIVE_OWNER	     (1U << 4)
+#define UET_VPP_SVM_CAP_MULTI_WORKER_SEGMENT (1U << 5)
 #define UET_VPP_SVM_REQUIRED_CAPABILITIES                                                          \
   (UET_VPP_SVM_CAP_DMA_SLOTS | UET_VPP_SVM_CAP_TX_SPSC | UET_VPP_SVM_CAP_RX_SPSC |                 \
-   UET_VPP_SVM_CAP_TX_GRAPH_COMPLETION | UET_VPP_SVM_CAP_EXCLUSIVE_OWNER)
+   UET_VPP_SVM_CAP_TX_GRAPH_COMPLETION | UET_VPP_SVM_CAP_EXCLUSIVE_OWNER |                         \
+   UET_VPP_SVM_CAP_MULTI_WORKER_SEGMENT)
 
-#define UET_VPP_SVM_CLIENT_F_DMA_READY (1U << 0)
+#define UET_VPP_SVM_CLIENT_F_DMA_READY	   (1U << 0)
 #define UET_VPP_SVM_SERVER_F_DMA_READY_ACK (1U << 0)
 
-#define UET_VPP_SVM_RX_F_IP4 (1U << 0)
-#define UET_VPP_SVM_RX_F_IP6 (1U << 1)
-#define UET_VPP_SVM_RX_F_UDP (1U << 2)
+#define UET_VPP_SVM_RX_F_IP4	(1U << 0)
+#define UET_VPP_SVM_RX_F_IP6	(1U << 1)
+#define UET_VPP_SVM_RX_F_UDP	(1U << 2)
 #define UET_VPP_SVM_MAX_RX_SEGS 8
 
 typedef enum
@@ -56,34 +58,48 @@ typedef struct
   uint16_t reserved0;
   uint32_t capabilities;
   uint32_t queue_depth;
-  uint32_t reserved1;
+  uint32_t worker_count;
   uint64_t segment_size;
   uint64_t generation;
-  uint64_t dma_slot_table_offset;
+  uint64_t worker_channel_table_offset;
   uint64_t dma_map_size;
-  uint32_t dma_slot_count;
-  uint32_t dma_slot_desc_size;
   uint32_t dma_buffer_data_size;
   uint16_t dma_buffer_pool_index;
-  uint16_t reserved2;
+  uint16_t worker_channel_desc_size;
+  uint32_t tx_desc_size;
+  uint32_t tx_completion_size;
+  uint32_t rx_desc_size;
+  uint32_t rx_release_size;
+  uint32_t client_flags;
+  uint32_t server_flags;
+  /* PID holding the lifetime lock on this application's SHM object. */
+  uint32_t owner_pid;
+  uint32_t server_dma_ready_count;
+  uint64_t reserved2[4];
+} uet_vpp_svm_shared_header_t;
+
+/*
+ * One descriptor per VPP worker.  Every offset addresses an independent
+ * SPSC object in the common application segment.  The descriptor is padded
+ * to two cache lines so future ABI-minor fields can be appended in place.
+ */
+typedef struct
+{
+  uint32_t worker_index;
+  uint32_t thread_index;
+  uint64_t dma_slot_table_offset;
+  uint32_t dma_slot_count;
+  uint32_t reserved0;
   uint64_t tx_ring_offset;
   uint64_t tx_completion_ring_offset;
   uint32_t tx_ring_size;
-  uint32_t tx_desc_size;
-  uint32_t tx_completion_size;
-  uint32_t reserved3;
+  uint32_t reserved1;
   uint64_t rx_ring_offset;
   uint64_t rx_release_ring_offset;
   uint32_t rx_ring_size;
-  uint32_t rx_desc_size;
-  uint32_t rx_release_size;
-  uint32_t reserved4;
-  uint32_t client_flags;
-  uint32_t server_flags;
-  /* PID holding the lifetime lock on this channel's SHM object. */
-  uint32_t owner_pid;
-  uint32_t reserved5;
-} uet_vpp_svm_shared_header_t;
+  uint32_t reserved2;
+  uint64_t reserved3[7];
+} uet_vpp_svm_worker_channel_t;
 
 typedef struct
 {
@@ -165,16 +181,25 @@ typedef struct
 #define UET_VPP_SVM_STATIC_ASSERT _Static_assert
 #endif
 
-UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_shared_header_t) == 152,
+UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_shared_header_t) == 128,
 			   "unexpected UET SVM shared header size");
 UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, segment_size) == 24,
 			   "unexpected UET SVM segment size field offset");
-UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, tx_ring_offset) == 72,
-			   "unexpected UET SVM TX ring offset field");
-UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, client_flags) == 136,
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, worker_channel_table_offset) ==
+			     40,
+			   "unexpected UET SVM worker channel table offset field");
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, client_flags) == 80,
 			   "unexpected UET SVM client flags offset");
-UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, owner_pid) == 144,
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, owner_pid) == 88,
 			   "unexpected UET SVM owner PID offset");
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, server_dma_ready_count) == 92,
+			   "unexpected UET SVM DMA ready count offset");
+UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_worker_channel_t) == 128,
+			   "unexpected UET SVM worker channel descriptor size");
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_worker_channel_t, tx_ring_offset) == 24,
+			   "unexpected UET SVM worker TX ring offset field");
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_worker_channel_t, rx_ring_offset) == 48,
+			   "unexpected UET SVM worker RX ring offset field");
 UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_dma_slot_t) == 16,
 			   "unexpected UET SVM DMA slot size");
 UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_spsc_ring_t) == 192,

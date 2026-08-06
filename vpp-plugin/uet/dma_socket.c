@@ -29,16 +29,10 @@ uet_dma_peer_authorize (clib_socket_t *client, uet_dma_peer_credentials_t *crede
   if (credentials_length != sizeof (*credentials) || credentials->pid <= 0)
     return -EACCES;
 
-  for (u32 worker = 0; worker < um->svm_channel_count; worker++)
-    {
-      u32 thread_index = vlib_get_worker_thread_index (worker);
-      uet_worker_t *uw = vec_elt_at_index (um->workers, thread_index);
-
-      if (uw->svm_attached && uw->svm_segment.sh &&
-	  clib_atomic_load_acq_n (&uw->svm_segment.sh->ready) &&
-	  clib_atomic_load_acq_n (&uw->svm_header->owner_pid) == credentials->pid)
-	return 0;
-    }
+  if (um->svm_channel_count && um->svm_segment.sh && um->svm_header &&
+      clib_atomic_load_acq_n (&um->svm_segment.sh->ready) &&
+      clib_atomic_load_acq_n (&um->svm_header->owner_pid) == credentials->pid)
+    return 0;
 
   return -EACCES;
 }
@@ -82,7 +76,7 @@ uet_dma_accept_ready (clib_file_t *uf)
       reply.status = 0;
       reply.generation = um->svm_generation;
       reply.map_size = um->dma_map_size;
-      reply.slot_count = um->svm_queue_depth;
+      reply.slot_count = um->svm_queue_depth * um->svm_channel_count;
       reply.buffer_data_size = um->dma_buffer_data_size;
       reply.buffer_pool_index = um->dma_buffer_pool_index;
       fd = pm->fd;

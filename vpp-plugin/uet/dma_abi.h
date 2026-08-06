@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define UET_VPP_DMA_ABI_MAGIC	0x414d4455U
-#define UET_VPP_DMA_ABI_VERSION 1
+#define UET_VPP_DMA_ABI_VERSION 2
 
 typedef struct
 {
