@@ -30,8 +30,10 @@ The initial provider implements:
 The provider reports `FI_THREAD_SAFE`. Control operations are serialized per
 domain, AV reads use an RW lock, and CQ reads use a per-CQ mutex. Data
 operations retain the existing engine's per-endpoint synchronization; there is
-no provider-wide datapath mutex. The current engine lifecycle permits one
-active domain per fabric.
+no provider-wide datapath mutex. The VPP engine additionally serializes access
+to each SPSC worker channel independently; receive-channel selection has one
+short engine-local lock. The current engine lifecycle permits one active
+domain per fabric.
 
 RMA, atomics, inject operations, counters, scalable endpoints, shared contexts,
 and connection-oriented endpoints are not advertised yet. The UET engine has
@@ -73,6 +75,14 @@ export UET_IFNAME=ens4f0np0
 The peer runs the same application and provider. Its backend may be selected
 independently.
 
+With multiple VPP workers, set `UET_VPP_SEGMENT` to the base used by
+`uet svm create`. The engine discovers and opens `<base>-w0` through
+`<base>-wN-1`; `UET_VPP_CHANNEL_COUNT` can override discovery when an explicit
+count is operationally preferable. TX selects a stable channel from the IP
+addresses and UET EV (native entropy value or UDP source port); RX polls the
+worker channels fairly. A literal single-worker segment preserves the existing
+behavior.
+
 ## Tests
 
 The backend-neutral lifecycle test exercises fabric, domain, AV, CQ, endpoint,
@@ -85,6 +95,19 @@ sudo env \
   UET_NIC_SHIM=rawsock \
   UET_IFNAME=ens4f0np0 \
   ./uet_provider_smoke 192.0.2.1
+```
+
+With a running VPP SDK and built plugin, the test can create and validate its
+own VPP instance. It defaults to one worker; `UET_VPP_WORKER_CORES=3,4,5,6`
+exercises four provider channels:
+
+```sh
+libfabric-provider/tests/vpp_smoke.sh \
+  /opt/vpp build/vpp-plugin "$PWD" ../libfabric
+
+UET_VPP_WORKER_CORES=3,4,5,6 \
+  libfabric-provider/tests/vpp_smoke.sh \
+  /opt/vpp build/vpp-plugin "$PWD" ../libfabric
 ```
 
 Functional validation also uses the unmodified libfabric `fi_pingpong`

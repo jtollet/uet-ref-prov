@@ -77,9 +77,11 @@ the datapath and no SPSC ring is shared between workers.
 
 For one worker, the SSVM segment uses the configured base name. For multiple
 workers, the segments are named `<base>-w0` through `<base>-wN-1`. One
-`libuet_vpp_client` object has one owner thread; a multithreaded provider opens
-one object per progress owner and VPP worker/queue. All worker channels export
-the same physical VPP buffer pool and currently must be on the same NUMA node.
+`libuet_vpp_client` object represents one SPSC channel. The VPP NIC engine
+opens all worker objects when `UET_VPP_CHANNEL_COUNT` is greater than one and
+serializes each independently, so unrelated channels do not share a datapath
+mutex. All worker channels export the same physical VPP buffer pool and
+currently must be on the same NUMA node.
 
 `libuet_vpp_client_open()` takes a non-blocking exclusive lock on the channel's
 SHM object before SSVM attaches. A second opener, whether it is another process
