@@ -905,6 +905,19 @@ static void uet_ep_key_init_local(struct uet_ep *uet_ep, uint16_t index)
 	key->index = index;
 }
 
+static uint16_t uet_ep_entropy_init(const struct uet_ep *uet_ep)
+{
+	uint32_t hash = 2166136261U;
+	uint16_t entropy;
+
+	hash = (hash ^ uet_ep->uet_addr.pid_on_fep) * 16777619U;
+	hash = (hash ^ uet_ep->uet_addr.start_index) * 16777619U;
+	hash = (hash ^ uet_ep->uet_addr.initiator_id) * 16777619U;
+	hash = (hash ^ uet_ep->job_id) * 16777619U;
+	entropy = (uint16_t)(hash ^ (hash >> 16));
+	return entropy ? entropy : 1;
+}
+
 /*
  * Insert an endpoint in the receive lookup table.  Software backends do not
  * yet have an external address allocator, so allocate the first free resource
@@ -6294,6 +6307,7 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 			UET_API_ERR("failed to allocate endpoint address");
 		goto err_exit;
 	}
+	uet_ep->entropy = uet_ep_entropy_init(uet_ep);
 
 	switch (info->tx_attr->tclass) {
 	case FI_TC_BEST_EFFORT:

@@ -34,8 +34,6 @@
 #include "imp_shim.h"
 #include "crc32c.h"
 
-#define UET_RUDI_ENTROPY 0x4242
-
 /* Per outstanding RUDI request (initiator side). Holds the built cleartext
  * frame for retransmit. On the security path the cleartext lives in the lower
  * half of pkt_buf (see uet_sec_enc_pkt) and only the TSC is refreshed on
@@ -209,6 +207,7 @@ static int uet_rudi_send(struct uet_instance *uet,
  */
 static int uet_rudi_build_frame(struct uet_instance *uet,
 				uint8_t tos,
+				uint16_t entropy,
 				const uint8_t *dst_mac,
 				const struct uet_fa *dst_fa,
 				bool is_ipv6, bool sec_enabled,
@@ -268,7 +267,7 @@ static int uet_rudi_build_frame(struct uet_instance *uet,
 	rp->pkt_len = (hdr_len + payload_len);
 
 	/* fill in the entropy */
-	entropy_hdr->entropy = htons(UET_RUDI_ENTROPY);
+	entropy_hdr->entropy = htons(entropy);
 	entropy_hdr->rsvd = 0;
 
 	/* fill in the RUDI header */
@@ -347,7 +346,8 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 
 	pkt_id = rudi.next_pkt_id++;
 
-	rc = uet_rudi_build_frame(uet, uet_ep->msg_ip_tos, av->nh_mac_addr,
+	rc = uet_rudi_build_frame(uet, uet_ep->msg_ip_tos, uet_ep->entropy,
+				  av->nh_mac_addr,
 				  &av->addr->fa, is_ipv6, sec_enabled,
 				  UET_PDS_TYPE_RUDI_REQ, next_hdr, pkt_id,
 				  ses, ses_len, pkt, pkt_len, rp);
@@ -449,7 +449,8 @@ static int uet_rudi_rx_req(struct uet_instance *uet,
 
 	/* FIXME: RUDI responses should use the DSCP controll codepoint */
 	memset(&rsp, 0, sizeof(rsp));
-	rc = uet_rudi_build_frame(uet, uet->default_msg_ip_tos, dst_mac,
+	rc = uet_rudi_build_frame(uet, uet->default_msg_ip_tos,
+				  pp->entropy_val, dst_mac,
 				  &dst_fa, pp->is_ipv6, sec_enabled,
 				  UET_PDS_TYPE_RUDI_RESP, rsp_next_hdr,
 				  pp->pds_rudi_pkt_id, rsp_ses_hdr,
@@ -575,4 +576,3 @@ int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 
 	return 0;
 }
-

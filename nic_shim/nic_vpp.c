@@ -172,6 +172,15 @@ static uint32_t nic_vpp_hash_mix(uint32_t hash, uint32_t value)
 	return hash;
 }
 
+static uint32_t nic_vpp_hash_finalize(uint32_t hash)
+{
+	hash ^= hash >> 16;
+	hash *= 0x7feb352dU;
+	hash ^= hash >> 15;
+	hash *= 0x846ca68bU;
+	return hash ^ (hash >> 16);
+}
+
 /*
  * Select a stable worker channel from the fields normally used as network
  * entropy.  Native UET places EV at the start of its entropy header; UDP uses
@@ -226,8 +235,7 @@ static size_t nic_vpp_select_channel(const struct vpp_data *vdata,
 		memcpy(&entropy, l4, sizeof(entropy));
 		hash = nic_vpp_hash_mix(hash, ntohs(entropy));
 	}
-	hash ^= hash >> 16;
-	return hash % vdata->channel_count;
+	return nic_vpp_hash_finalize(hash) % vdata->channel_count;
 }
 
 int nic_vpp_getinfo(struct uet_nic *nic, struct uet_nic_info *nic_info)

@@ -30,8 +30,6 @@
 #include "imp_shim.h"
 #include "crc32c.h"
 
-#define UET_UUD_ENTROPY 0x5555
-
 /* scratch structure for building/transmitting one UUD datagram. */
 struct uet_uud_pkt {
 	uint8_t  *pkt_buf; /* full buffer (incl sec headroom) */
@@ -139,6 +137,7 @@ static int uet_uud_send(struct uet_instance *uet, struct uet_uud_pkt *up)
  */
 static int uet_uud_build_frame(struct uet_instance *uet,
 			       uint8_t tos,
+			       uint16_t entropy,
 			       const uint8_t *dst_mac,
 			       const struct uet_fa *dst_fa,
 			       bool is_ipv6, bool sec_enabled,
@@ -196,7 +195,7 @@ static int uet_uud_build_frame(struct uet_instance *uet,
 	up->pkt_len = (hdr_len + payload_len);
 
 	/* fill in the entropy */
-	entropy_hdr->entropy = htons(UET_UUD_ENTROPY);
+	entropy_hdr->entropy = htons(entropy);
 	entropy_hdr->rsvd = 0;
 
 	/* fill in the UUD header */
@@ -271,7 +270,8 @@ int uet_pds_uud_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	up.ssi         = ssi;
 	up.is_ipv6     = is_ipv6;
 
-	rc = uet_uud_build_frame(uet, uet_ep->msg_ip_tos, av->nh_mac_addr,
+	rc = uet_uud_build_frame(uet, uet_ep->msg_ip_tos, uet_ep->entropy,
+				 av->nh_mac_addr,
 				 &av->addr->fa, is_ipv6, sec_enabled, next_hdr,
 				 ses, ses_len, pkt, pkt_len, &up);
 	if (rc != 0)

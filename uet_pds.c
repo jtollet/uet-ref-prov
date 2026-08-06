@@ -1916,7 +1916,7 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 
 	/* fill in the entropy header */
 	/* TODO: UDP support */
-	entropy_hdr->entropy = htons(UET_DEFAULT_ENTROPY);
+	entropy_hdr->entropy = htons(uet_ep->entropy);
 
 	/* fill in the PDS header */
 
