@@ -82,6 +82,10 @@ fi
 
 cli=("$vppctl_bin" -s "$runtime_dir/cli.sock")
 "${cli[@]}" uet enable
+grep -q '^rx-placement current-worker$' <<<"$("${cli[@]}" show uet | tr -d '\r')"
+"${cli[@]}" uet rx placement entropy-handoff
+grep -q '^rx-placement entropy-handoff$' <<<"$("${cli[@]}" show uet | tr -d '\r')"
+"${cli[@]}" uet rx placement current-worker
 "${cli[@]}" uet svm create name "$segment_name" queue-size 256
 
 library_path="$plugin_build_dir/lib:$vpp_prefix/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

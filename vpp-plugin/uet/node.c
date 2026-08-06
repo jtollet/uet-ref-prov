@@ -29,7 +29,8 @@ typedef enum
 #define foreach_uet_local_error                                                                    \
   _ (NO_CLIENT, "UET packet dropped: no ready external client")                                    \
   _ (RING_FULL, "UET packet dropped: external RX ring full")                                       \
-  _ (BAD_CHAIN, "UET packet dropped: invalid VLIB buffer chain")
+  _ (BAD_CHAIN, "UET packet dropped: invalid VLIB buffer chain")                                   \
+  _ (HANDOFF_QUEUE_FULL, "UET packet dropped: worker handoff queue full")
 
 typedef enum
 {
@@ -576,12 +577,11 @@ typedef enum
 } uet_local_next_t;
 
 static_always_inline uword
-uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame, u8 is_ip4,
-		 u8 is_udp)
+uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_vectors, u8 is_ip4,
+		   u8 is_udp)
 {
   uet_main_t *um = &uet_main;
   uet_worker_t *uw = 0;
-  u32 *from = vlib_frame_vector_args (frame);
   u32 drop_buffers[VLIB_FRAME_SIZE];
   u32 n_drop = 0;
   u64 bytes = 0;
@@ -593,27 +593,27 @@ uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
       uw = vec_elt_at_index (um->workers, vm->thread_index);
       if (PREDICT_TRUE (uw->svm_attached))
 	uet_rx_release_process (vm, uw);
-      for (u32 i = 0; i < frame->n_vectors; i++)
+      for (u32 i = 0; i < n_vectors; i++)
 	bytes += uet_rx_ip_packet_length (vm, vlib_get_buffer (vm, from[i]), is_ip4);
 
       if (is_udp && is_ip4)
 	{
-	  uw->rx_udp4_packets += frame->n_vectors;
+	  uw->rx_udp4_packets += n_vectors;
 	  uw->rx_udp4_bytes += bytes;
 	}
       else if (is_udp)
 	{
-	  uw->rx_udp6_packets += frame->n_vectors;
+	  uw->rx_udp6_packets += n_vectors;
 	  uw->rx_udp6_bytes += bytes;
 	}
       else if (is_ip4)
 	{
-	  uw->rx_ip4_packets += frame->n_vectors;
+	  uw->rx_ip4_packets += n_vectors;
 	  uw->rx_ip4_bytes += bytes;
 	}
       else
 	{
-	  uw->rx_ip6_packets += frame->n_vectors;
+	  uw->rx_ip6_packets += n_vectors;
 	  uw->rx_ip6_bytes += bytes;
 	}
 
@@ -625,7 +625,7 @@ uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 	  u32 producer = clib_atomic_load_relax_n (&ring->producer);
 	  u32 consumer = clib_atomic_load_acq_n (&ring->consumer);
 
-	  for (u32 i = 0; i < frame->n_vectors; i++)
+	  for (u32 i = 0; i < n_vectors; i++)
 	    {
 	      u32 buffer_index = from[i];
 	      vlib_buffer_t *buffer = vlib_get_buffer (vm, buffer_index);
@@ -681,7 +681,7 @@ uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 	}
       else
 	{
-	  for (u32 i = 0; i < frame->n_vectors; i++)
+	  for (u32 i = 0; i < n_vectors; i++)
 	    {
 	      vlib_buffer_t *buffer = vlib_get_buffer (vm, from[i]);
 
@@ -696,7 +696,7 @@ uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
     }
   else
     {
-      for (u32 i = 0; i < frame->n_vectors; i++)
+      for (u32 i = 0; i < n_vectors; i++)
 	{
 	  vlib_buffer_t *buffer = vlib_get_buffer (vm, from[i]);
 
@@ -711,6 +711,95 @@ uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame
 
   if (n_drop)
     vlib_buffer_enqueue_to_single_next (vm, node, drop_buffers, UET_LOCAL_NEXT_DROP, n_drop);
+  return n_vectors;
+}
+
+static_always_inline u16
+uet_rx_target_thread (vlib_main_t *vm, vlib_buffer_t *buffer, u8 is_ip4)
+{
+  u8 *start = buffer->data + vnet_buffer (buffer)->l3_hdr_offset;
+  u8 *end = vlib_buffer_get_current (buffer) + buffer->current_length;
+  u8 *entropy;
+  u32 hash;
+  u16 value;
+
+  if (PREDICT_FALSE (start < buffer->data - VLIB_BUFFER_PRE_DATA_SIZE || start >= end))
+    return vm->thread_index;
+
+  if (is_ip4)
+    {
+      ip4_header_t *ip4 = (ip4_header_t *) start;
+      u32 header_length;
+
+      if (PREDICT_FALSE ((uword) (end - start) < sizeof (*ip4)))
+	return vm->thread_index;
+      header_length = ip4_header_bytes (ip4);
+      if (PREDICT_FALSE (header_length < sizeof (*ip4) ||
+			 (uword) (end - start) < header_length + sizeof (value)))
+	return vm->thread_index;
+      entropy = start + header_length;
+    }
+  else
+    {
+      if (PREDICT_FALSE ((uword) (end - start) < sizeof (ip6_header_t) + sizeof (value)))
+	return vm->thread_index;
+      entropy = start + sizeof (ip6_header_t);
+    }
+
+  clib_memcpy_fast (&value, entropy, sizeof (value));
+  hash = clib_net_to_host_u16 (value);
+  hash ^= hash >> 7;
+  hash *= 0x9e3779b1U;
+  hash ^= hash >> 16;
+  return vlib_get_worker_thread_index (hash % vlib_num_workers ());
+}
+
+static_always_inline uet_rx_path_t
+uet_rx_path (u8 is_ip4, u8 is_udp)
+{
+  if (is_udp)
+    return is_ip4 ? UET_RX_PATH_IP4_UDP : UET_RX_PATH_IP6_UDP;
+  return is_ip4 ? UET_RX_PATH_IP4_NATIVE : UET_RX_PATH_IP6_NATIVE;
+}
+
+static_always_inline uword
+uet_local_input (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame, u8 is_ip4,
+		 u8 is_udp)
+{
+  uet_main_t *um = &uet_main;
+  u32 *from = vlib_frame_vector_args (frame);
+  u32 local_buffers[VLIB_FRAME_SIZE], remote_buffers[VLIB_FRAME_SIZE];
+  u16 remote_threads[VLIB_FRAME_SIZE];
+  u32 n_local = 0, n_remote = 0;
+
+  if (PREDICT_TRUE (!um->rx_entropy_handoff || vlib_num_workers () == 1))
+    return uet_local_deliver (vm, node, from, frame->n_vectors, is_ip4, is_udp);
+
+  for (u32 i = 0; i < frame->n_vectors; i++)
+    {
+      u16 target = uet_rx_target_thread (vm, vlib_get_buffer (vm, from[i]), is_ip4);
+
+      if (target == vm->thread_index)
+	local_buffers[n_local++] = from[i];
+      else
+	{
+	  remote_buffers[n_remote] = from[i];
+	  remote_threads[n_remote++] = target;
+	}
+    }
+
+  if (n_remote)
+    {
+      u32 n_enqueued = vlib_buffer_enqueue_to_thread (
+	vm, node, um->rx_handoff_queue_indices[uet_rx_path (is_ip4, is_udp)], remote_buffers,
+	remote_threads, n_remote);
+
+      if (PREDICT_FALSE (n_enqueued != n_remote))
+	vlib_node_increment_counter (vm, node->node_index, UET_LOCAL_ERROR_HANDOFF_QUEUE_FULL,
+				     n_remote - n_enqueued);
+    }
+  if (n_local)
+    uet_local_deliver (vm, node, local_buffers, n_local, is_ip4, is_udp);
   return frame->n_vectors;
 }
 
@@ -736,6 +825,34 @@ VLIB_NODE_FN (uet6_udp_input_node)
 (vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
 {
   return uet_local_input (vm, node, frame, 0 /* is_ip4 */, 1 /* is_udp */);
+}
+
+VLIB_NODE_FN (uet4_ip_handoff_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return uet_local_deliver (vm, node, vlib_frame_vector_args (frame), frame->n_vectors,
+			    1 /* is_ip4 */, 0 /* is_udp */);
+}
+
+VLIB_NODE_FN (uet6_ip_handoff_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return uet_local_deliver (vm, node, vlib_frame_vector_args (frame), frame->n_vectors,
+			    0 /* is_ip4 */, 0 /* is_udp */);
+}
+
+VLIB_NODE_FN (uet4_udp_handoff_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return uet_local_deliver (vm, node, vlib_frame_vector_args (frame), frame->n_vectors,
+			    1 /* is_ip4 */, 1 /* is_udp */);
+}
+
+VLIB_NODE_FN (uet6_udp_handoff_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  return uet_local_deliver (vm, node, vlib_frame_vector_args (frame), frame->n_vectors,
+			    0 /* is_ip4 */, 1 /* is_udp */);
 }
 
 #ifndef CLIB_MARCH_VARIANT
@@ -822,6 +939,10 @@ UET_LOCAL_NODE_REGISTER (uet4_ip_input_node, "uet4-ip-input");
 UET_LOCAL_NODE_REGISTER (uet6_ip_input_node, "uet6-ip-input");
 UET_LOCAL_NODE_REGISTER (uet4_udp_input_node, "uet4-udp-input");
 UET_LOCAL_NODE_REGISTER (uet6_udp_input_node, "uet6-udp-input");
+UET_LOCAL_NODE_REGISTER (uet4_ip_handoff_node, "uet4-ip-handoff");
+UET_LOCAL_NODE_REGISTER (uet6_ip_handoff_node, "uet6-ip-handoff");
+UET_LOCAL_NODE_REGISTER (uet4_udp_handoff_node, "uet4-udp-handoff");
+UET_LOCAL_NODE_REGISTER (uet6_udp_handoff_node, "uet6-udp-handoff");
 
 #undef UET_LOCAL_NODE_REGISTER
 #endif

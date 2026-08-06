@@ -49,6 +49,17 @@ A packet for a routed destination remains transit traffic even when its IP
 protocol or UDP port matches UET. A local UDP packet for another port also
 does not enter the plugin.
 
+By default, RX delivery keeps the worker selected by the normal VPP input
+graph (`uet rx placement current-worker`). This preserves hardware RSS
+placement without adding a cross-worker hop. On a device that cannot include
+native UET entropy in its RSS hash, `uet rx placement entropy-handoff`
+extracts the native EV, or the UDP source port, after local IP/UDP dispatch and
+hands the packet to a stable VPP worker before publishing it to SVM. This mode
+is driver-independent and allows different endpoint entropy values to use
+different worker channels. The original worker still performs device input
+and IP local lookup, so this software handoff is not a substitute for
+programmable hardware RSS when line-rate ingress scaling is required.
+
 Provider TX starts with a complete IPv4 or IPv6 packet, not an Ethernet frame.
 The worker validates the IP length and UET protocol/port, then enqueues the
 VLIB buffer to `ip4-lookup` or `ip6-lookup`. `uet tx fib table <table-id>`
@@ -198,11 +209,13 @@ plugins {
 }
 
 uet enable
+uet rx placement entropy-handoff
 uet svm create name uet queue-size 4096
 ```
 
 This uses IPv4 and IPv6 table 0. Add `uet tx fib ...` before or after `uet
-enable` only to select other tables.
+enable` only to select other tables. The RX placement command is optional;
+`current-worker` is the default.
 
 The following native VPP facilities expose the useful operational state:
 
@@ -219,11 +232,11 @@ clear uet counters
 
 `show uet` gives aggregate and per-worker channel state. Standard node errors
 count malformed external TX requests, completion-ring saturation, invalid RX
-releases, absent clients, RX-ring saturation, and malformed VLIB chains. Packet
-traces identify direction, worker, native-IP versus UDP encapsulation, IP
-version, packet length, request/RX identifier, and delivery/drop disposition.
-Lifecycle events use the `uet` VPP log class; detailed mapping-export messages
-are emitted only at debug level.
+releases, absent clients, RX-ring saturation, malformed VLIB chains, and worker
+handoff queue saturation. Packet traces identify direction, worker, native-IP
+versus UDP encapsulation, IP version, packet length, request/RX identifier, and
+delivery/drop disposition. Lifecycle events use the `uet` VPP log class;
+detailed mapping-export messages are emitted only at debug level.
 
 The binary API mirrors the controls with `uet_enable_disable`,
 `uet_svm_create`, `uet_svm_delete`, `uet_tx_fib_set`, and

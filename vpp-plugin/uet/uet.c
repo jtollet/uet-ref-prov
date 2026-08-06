@@ -7,6 +7,7 @@
 
 #include <uet/uet.h>
 
+#include <vlib/handoff.h>
 #include <vlib/physmem_funcs.h>
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
@@ -775,6 +776,34 @@ VLIB_CLI_COMMAND (uet_tx_fib_command, static) = {
   .function = uet_tx_fib_command_fn,
 };
 
+static clib_error_t *
+uet_rx_placement_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_t *cmd)
+{
+  u8 entropy_handoff;
+
+  if (unformat (input, "current-worker"))
+    entropy_handoff = 0;
+  else if (unformat (input, "entropy-handoff"))
+    entropy_handoff = 1;
+  else
+    return clib_error_return (0, "expected current-worker or entropy-handoff");
+  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    return clib_error_return (0, "unexpected input `%U'", format_unformat_error, input);
+
+  vlib_worker_thread_barrier_sync (vm);
+  uet_main.rx_entropy_handoff = entropy_handoff;
+  vlib_worker_thread_barrier_release (vm);
+  uet_log_notice ("RX placement uses %s",
+		  entropy_handoff ? "entropy handoff" : "the current worker");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (uet_rx_placement_command, static) = {
+  .path = "uet rx placement",
+  .short_help = "uet rx placement current-worker|entropy-handoff",
+  .function = uet_rx_placement_command_fn,
+};
+
 typedef struct
 {
   u32 thread_index;
@@ -888,6 +917,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   vlib_cli_output (vm, "state %s", um->enabled ? "enabled" : "disabled");
   vlib_cli_output (vm, "main-thread 0");
   vlib_cli_output (vm, "workers %u", worker_count);
+  vlib_cli_output (vm, "rx-placement %s",
+		   um->rx_entropy_handoff ? "entropy-handoff" : "current-worker");
   if (worker_count == 1)
     vlib_cli_output (vm, "owner-worker %U", format_vlib_thread_name_and_index,
 		     vlib_get_worker_thread_index (0));
@@ -1202,6 +1233,12 @@ static clib_error_t *
 uet_init (vlib_main_t *vm)
 {
   uet_main_t *um = &uet_main;
+  vlib_node_registration_t *rx_handoff_nodes[UET_RX_N_PATHS] = {
+    [UET_RX_PATH_IP4_NATIVE] = &uet4_ip_handoff_node,
+    [UET_RX_PATH_IP6_NATIVE] = &uet6_ip_handoff_node,
+    [UET_RX_PATH_IP4_UDP] = &uet4_udp_handoff_node,
+    [UET_RX_PATH_IP6_UDP] = &uet6_udp_handoff_node,
+  };
   u32 n_threads = vlib_get_thread_main ()->n_vlib_mains;
   u32 i;
 
@@ -1215,6 +1252,12 @@ uet_init (vlib_main_t *vm)
   um->tx_ip6_table_id = ~0;
   um->fib_source = fib_source_allocate ("uet", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_SIMPLE);
   vec_validate_aligned (um->workers, n_threads - 1, CLIB_CACHE_LINE_BYTES);
+
+  for (uet_rx_path_t path = 0; path < UET_RX_N_PATHS; path++)
+    um->rx_handoff_queue_indices[path] =
+      vlib_handoff_alloc_queues (&(vlib_handoff_alloc_queues_args_t){
+	.node_index = rx_handoff_nodes[path]->index,
+      });
 
   for (i = 0; i < n_threads; i++)
     {

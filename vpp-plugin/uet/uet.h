@@ -18,6 +18,15 @@
 #define UET_IP_PROTOCOL		 253
 #define UET_UDP_PORT		 49150
 
+typedef enum
+{
+  UET_RX_PATH_IP4_NATIVE,
+  UET_RX_PATH_IP6_NATIVE,
+  UET_RX_PATH_IP4_UDP,
+  UET_RX_PATH_IP6_UDP,
+  UET_RX_N_PATHS,
+} uet_rx_path_t;
+
 /*
  * Each worker owns one independent datapath channel.  The main thread may
  * inspect it only while holding the worker barrier.  No datapath lock is
@@ -93,6 +102,10 @@ typedef struct
   /* Indexed by VPP thread index; index zero is the main thread. */
   uet_worker_t *workers;
 
+  /* Optional generic RX placement by native EV or UDP source port. */
+  u32 rx_handoff_queue_indices[UET_RX_N_PATHS];
+  u8 rx_entropy_handoff;
+
   u8 *svm_base_name;
   u32 svm_channel_count;
   u32 svm_queue_depth;
@@ -125,6 +138,10 @@ extern vlib_node_registration_t uet4_ip_input_node;
 extern vlib_node_registration_t uet6_ip_input_node;
 extern vlib_node_registration_t uet4_udp_input_node;
 extern vlib_node_registration_t uet6_udp_input_node;
+extern vlib_node_registration_t uet4_ip_handoff_node;
+extern vlib_node_registration_t uet6_ip_handoff_node;
+extern vlib_node_registration_t uet4_udp_handoff_node;
+extern vlib_node_registration_t uet6_udp_handoff_node;
 
 int uet_enable_disable (u8 enable);
 int uet_svm_create (const char *segment_name, u32 queue_depth);
