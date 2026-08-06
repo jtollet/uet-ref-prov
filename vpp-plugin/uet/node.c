@@ -28,6 +28,7 @@ typedef enum
 
 #define foreach_uet_local_error                                                                    \
   _ (NO_CLIENT, "UET packet dropped: no ready external client")                                    \
+  _ (AMBIGUOUS_CLIENT, "UET packet dropped: multiple clients without endpoint demux")              \
   _ (RING_FULL, "UET packet dropped: external RX ring full")                                       \
   _ (BAD_CHAIN, "UET packet dropped: invalid VLIB buffer chain")                                   \
   _ (HANDOFF_QUEUE_FULL, "UET packet dropped: worker handoff queue full")
@@ -45,6 +46,7 @@ typedef enum
   UET_TRACE_TX_ROUTED,
   UET_TRACE_RX_DELIVERED,
   UET_TRACE_RX_NO_CLIENT,
+  UET_TRACE_RX_AMBIGUOUS_CLIENT,
   UET_TRACE_RX_RING_FULL,
   UET_TRACE_RX_BAD_CHAIN,
 } uet_trace_disposition_t;
@@ -209,9 +211,9 @@ uet_spsc_index (const uet_vpp_svm_spsc_ring_t *ring, u32 counter)
 }
 
 static_always_inline void
-uet_rx_release_process (vlib_main_t *vm, uet_worker_t *uw)
+uet_rx_release_process (vlib_main_t *vm, uet_worker_t *uw, uet_worker_channel_t *channel)
 {
-  uet_vpp_svm_spsc_ring_t *ring = uw->rx_release_ring;
+  uet_vpp_svm_spsc_ring_t *ring = channel->rx_release_ring;
   u32 consumer = clib_atomic_load_relax_n (&ring->consumer);
   u32 producer = clib_atomic_load_acq_n (&ring->producer);
   u32 available = producer - consumer;
@@ -227,24 +229,25 @@ uet_rx_release_process (vlib_main_t *vm, uet_worker_t *uw)
   for (u32 i = 0; i < available; i++)
     {
       const uet_vpp_svm_rx_release_t *release =
-	uw->rx_release_entries + uet_spsc_index (ring, consumer + i);
+	channel->rx_release_entries + uet_spsc_index (ring, consumer + i);
       u32 token = release->release_token;
 
-      if (release->reserved || !release->rx_id || token >= uw->dma_slot_count ||
-	  uw->rx_ids[token] != release->rx_id)
+      if (release->reserved || !release->rx_id || token >= channel->dma_slot_count ||
+	  channel->rx_ids[token] != release->rx_id)
 	{
 	  uw->rx_invalid_releases++;
 	  uet_tx_error_count (vm, UET_TX_ERROR_INVALID_RX_RELEASE);
 	  continue;
 	}
 
-      vlib_buffer_free_one (vm, uw->rx_buffer_indices[token]);
-      uw->rx_ids[token] = 0;
-      uw->rx_buffer_indices[token] = ~0;
-      ASSERT (uw->rx_free_count < uw->dma_slot_count);
-      uw->rx_free_slots[uw->rx_free_count++] = token;
+      vlib_buffer_free_one (vm, channel->rx_buffer_indices[token]);
+      channel->rx_ids[token] = 0;
+      channel->rx_buffer_indices[token] = ~0;
+      ASSERT (channel->rx_free_count < channel->dma_slot_count);
+      channel->rx_free_slots[channel->rx_free_count++] = token;
       uw->rx_releases++;
-      ASSERT (uw->rx_outstanding > 0);
+      ASSERT (channel->rx_outstanding > 0 && uw->rx_outstanding > 0);
+      channel->rx_outstanding--;
       uw->rx_outstanding--;
     }
 
@@ -348,12 +351,12 @@ uet_rx_ip_packet_length (vlib_main_t *vm, vlib_buffer_t *buffer, u8 is_ip4)
 }
 
 static_always_inline void
-uet_tx_completion_add (uet_worker_t *uw, const uet_vpp_svm_tx_completion_t *completion,
-		       u32 *producer)
+uet_tx_completion_add (uet_worker_t *uw, uet_worker_channel_t *channel,
+		       const uet_vpp_svm_tx_completion_t *completion, u32 *producer)
 {
-  u32 index = uet_spsc_index (uw->tx_completion_ring, *producer);
+  u32 index = uet_spsc_index (channel->tx_completion_ring, *producer);
 
-  clib_memcpy_fast (uw->tx_completion_entries + index, completion, sizeof (*completion));
+  clib_memcpy_fast (channel->tx_completion_entries + index, completion, sizeof (*completion));
   (*producer)++;
   uw->tx_completions++;
 }
@@ -364,7 +367,7 @@ uet_tx_completion_add (uet_worker_t *uw, const uet_vpp_svm_tx_completion_t *comp
  * no output-interface or device-node knowledge is required to reclaim it.
  */
 static_always_inline int
-uet_dma_slot_replace (vlib_main_t *vm, uet_main_t *um, uet_worker_t *uw, u32 slot,
+uet_dma_slot_replace (vlib_main_t *vm, uet_main_t *um, uet_worker_channel_t *channel, u32 slot,
 		      u32 *tx_buffer_index)
 {
   u32 replacement_index;
@@ -383,20 +386,20 @@ uet_dma_slot_replace (vlib_main_t *vm, uet_main_t *um, uet_worker_t *uw, u32 slo
       return 0;
     }
 
-  *tx_buffer_index = uw->dma_buffer_indices[slot];
-  uw->dma_buffer_indices[slot] = replacement_index;
-  uw->dma_slots[slot].data_offset = data_offset;
-  uw->dma_slots[slot].capacity = um->dma_buffer_data_size;
+  *tx_buffer_index = channel->dma_buffer_indices[slot];
+  channel->dma_buffer_indices[slot] = replacement_index;
+  channel->dma_slots[slot].data_offset = data_offset;
+  channel->dma_slots[slot].capacity = um->dma_buffer_data_size;
   return 1;
 }
 
 static_always_inline void
-uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, u32 *tx_buffers, u16 *tx_nexts,
-		u64 *tx_trace_ids, u32 *n_tx)
+uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, uet_worker_channel_t *channel, u32 *tx_buffers,
+		u16 *tx_nexts, u64 *tx_trace_ids, u32 *n_tx)
 {
   uet_main_t *um = &uet_main;
-  uet_vpp_svm_spsc_ring_t *tx_ring = uw->tx_ring;
-  uet_vpp_svm_spsc_ring_t *cq_ring = uw->tx_completion_ring;
+  uet_vpp_svm_spsc_ring_t *tx_ring = channel->tx_ring;
+  uet_vpp_svm_spsc_ring_t *cq_ring = channel->tx_completion_ring;
   u32 cq_producer = clib_atomic_load_relax_n (&cq_ring->producer);
   u32 cq_initial_producer = cq_producer;
   u32 cq_consumer = clib_atomic_load_acq_n (&cq_ring->consumer);
@@ -421,7 +424,7 @@ uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, u32 *tx_buffers, u16 *tx_next
   while (n_processed < tx_available && *n_tx < UET_SPSC_MAX_BATCH)
     {
       u32 index = uet_spsc_index (tx_ring, tx_consumer + n_processed);
-      const uet_vpp_svm_tx_desc_t *desc = uw->tx_descs + index;
+      const uet_vpp_svm_tx_desc_t *desc = channel->tx_descs + index;
       u32 slot = desc->dma_slot;
       uet_vpp_svm_tx_completion_t completion = {
 	.dma_slot = UET_VPP_SVM_INVALID_DMA_SLOT,
@@ -437,12 +440,12 @@ uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, u32 *tx_buffers, u16 *tx_next
 	  break;
 	}
 
-      if (slot < uw->dma_slot_count)
+      if (slot < channel->dma_slot_count)
 	completion.dma_slot = slot;
       if (!uw->tx_configured)
 	completion.status = UET_VPP_SVM_STATUS_TX_NOT_CONFIGURED;
-      else if (slot >= uw->dma_slot_count || desc->packet_length > uw->dma_slots[slot].capacity ||
-	       desc->reserved)
+      else if (slot >= channel->dma_slot_count ||
+	       desc->packet_length > channel->dma_slots[slot].capacity || desc->reserved)
 	{
 	  completion.status = UET_VPP_SVM_STATUS_INVALID_PACKET;
 	  uw->invalid_requests++;
@@ -450,7 +453,7 @@ uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, u32 *tx_buffers, u16 *tx_next
 	}
       else
 	{
-	  vlib_buffer_t *buffer = vlib_get_buffer (vm, uw->dma_buffer_indices[slot]);
+	  vlib_buffer_t *buffer = vlib_get_buffer (vm, channel->dma_buffer_indices[slot]);
 
 	  if (clib_atomic_load_acq_n (&buffer->ref_count) != 1)
 	    {
@@ -463,10 +466,10 @@ uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, u32 *tx_buffers, u16 *tx_next
 	}
 
       if (!valid)
-	uet_tx_completion_add (uw, &completion, &cq_producer);
+	uet_tx_completion_add (uw, channel, &completion, &cq_producer);
       else
 	{
-	  vlib_buffer_t *buffer = vlib_get_buffer (vm, uw->dma_buffer_indices[slot]);
+	  vlib_buffer_t *buffer = vlib_get_buffer (vm, channel->dma_buffer_indices[slot]);
 	  vlib_buffer_pool_t *pool = vlib_get_buffer_pool (vm, buffer->buffer_pool_index);
 
 	  vlib_buffer_copy_template (buffer, &pool->buffer_template);
@@ -476,15 +479,15 @@ uet_tx_process (vlib_main_t *vm, uet_worker_t *uw, u32 *tx_buffers, u16 *tx_next
 	      completion.status = UET_VPP_SVM_STATUS_INVALID_PACKET;
 	      uw->invalid_requests++;
 	      uet_tx_error_count (vm, UET_TX_ERROR_INVALID_REQUEST);
-	      uet_tx_completion_add (uw, &completion, &cq_producer);
+	      uet_tx_completion_add (uw, channel, &completion, &cq_producer);
 	      goto next_request;
 	    }
-	  if (!uet_dma_slot_replace (vm, um, uw, slot, tx_buffers + *n_tx))
+	  if (!uet_dma_slot_replace (vm, um, channel, slot, tx_buffers + *n_tx))
 	    break;
 
 	  completion.status = UET_VPP_SVM_STATUS_OK;
 	  completion.completed_length = desc->packet_length;
-	  uet_tx_completion_add (uw, &completion, &cq_producer);
+	  uet_tx_completion_add (uw, channel, &completion, &cq_producer);
 	  tx_trace_ids[*n_tx] = desc->request_id;
 	  (*n_tx)++;
 	  uw->tx_packets++;
@@ -523,7 +526,8 @@ uet_tx_trace_batch (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw
 }
 
 static_always_inline u32
-uet_svm_process (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw)
+uet_svm_process (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw,
+		 uet_worker_channel_t *channel)
 {
   u32 tx_buffers[UET_SPSC_MAX_BATCH + 1];
   u16 tx_nexts[UET_SPSC_MAX_BATCH + 1];
@@ -531,16 +535,16 @@ uet_svm_process (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw)
   u32 n_tx = 0;
   u32 client_flags;
 
-  client_flags = clib_atomic_load_acq_n (&uw->svm_header->client_flags);
-  if (!!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY) != uw->dma_ready_ack)
+  client_flags = clib_atomic_load_acq_n (&channel->svm_header->client_flags);
+  if (!!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY) != channel->dma_ready_ack)
     {
       if (client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY)
 	{
-	  u32 ready = clib_atomic_add_fetch (&uw->svm_header->server_dma_ready_count, 1);
+	  u32 ready = clib_atomic_add_fetch (&channel->svm_header->server_dma_ready_count, 1);
 
-	  uw->dma_ready_ack = 1;
-	  if (ready == uw->svm_header->worker_count)
-	    clib_atomic_store_rel_n (&uw->svm_header->server_flags,
+	  channel->dma_ready_ack = 1;
+	  if (ready == channel->svm_header->worker_count)
+	    clib_atomic_store_rel_n (&channel->svm_header->server_flags,
 				     UET_VPP_SVM_SERVER_F_DMA_READY_ACK);
 	}
       else
@@ -550,28 +554,29 @@ uet_svm_process (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw)
 	   * this worker no longer touches the old owner state.
 	   */
 	  for (u32 batch = 0;
-	       batch < (uw->dma_slot_count + UET_SPSC_MAX_BATCH - 1) / UET_SPSC_MAX_BATCH; batch++)
+	       batch < (channel->dma_slot_count + UET_SPSC_MAX_BATCH - 1) / UET_SPSC_MAX_BATCH;
+	       batch++)
 	    {
-	      u32 consumer = clib_atomic_load_relax_n (&uw->rx_release_ring->consumer);
-	      u32 producer = clib_atomic_load_acq_n (&uw->rx_release_ring->producer);
+	      u32 consumer = clib_atomic_load_relax_n (&channel->rx_release_ring->consumer);
+	      u32 producer = clib_atomic_load_acq_n (&channel->rx_release_ring->producer);
 
 	      if (producer == consumer)
 		break;
-	      uet_rx_release_process (vm, uw);
+	      uet_rx_release_process (vm, uw, channel);
 	    }
-	  u32 ready = clib_atomic_sub_fetch (&uw->svm_header->server_dma_ready_count, 1);
+	  u32 ready = clib_atomic_sub_fetch (&channel->svm_header->server_dma_ready_count, 1);
 
-	  uw->dma_ready_ack = 0;
+	  channel->dma_ready_ack = 0;
 	  if (!ready)
-	    clib_atomic_store_rel_n (&uw->svm_header->server_flags, 0);
+	    clib_atomic_store_rel_n (&channel->svm_header->server_flags, 0);
 	}
     }
 
   if (!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY))
     return 0;
 
-  uet_rx_release_process (vm, uw);
-  uet_tx_process (vm, uw, tx_buffers, tx_nexts, tx_trace_ids, &n_tx);
+  uet_rx_release_process (vm, uw, channel);
+  uet_tx_process (vm, uw, channel, tx_buffers, tx_nexts, tx_trace_ids, &n_tx);
 
   if (n_tx)
     {
@@ -588,6 +593,7 @@ VLIB_NODE_FN (uet_input_node)
 {
   uet_main_t *um = &uet_main;
   uet_worker_t *uw;
+  u32 n_tx = 0;
 
   if (PREDICT_FALSE (!um->enabled || vm->thread_index == 0 ||
 		     vm->thread_index >= vec_len (um->workers)))
@@ -598,10 +604,15 @@ VLIB_NODE_FN (uet_input_node)
 
   uw->poll_calls++;
 
-  if (PREDICT_TRUE (uw->svm_attached))
-    return uet_svm_process (vm, node, uw);
+  for (u32 client_index = 0; client_index < vec_len (uw->channels); client_index++)
+    {
+      uet_worker_channel_t *channel = uw->channels + client_index;
 
-  return 0;
+      if (PREDICT_TRUE (channel->active))
+	n_tx += uet_svm_process (vm, node, uw, channel);
+    }
+
+  return n_tx;
 }
 
 typedef enum
@@ -610,23 +621,50 @@ typedef enum
   UET_LOCAL_N_NEXT,
 } uet_local_next_t;
 
+static_always_inline uet_worker_channel_t *
+uet_rx_channel_select (uet_worker_t *uw, u8 *ambiguous)
+{
+  uet_worker_channel_t *selected = 0;
+
+  *ambiguous = 0;
+  for (u32 client_index = 0; client_index < vec_len (uw->channels); client_index++)
+    {
+      uet_worker_channel_t *channel = uw->channels + client_index;
+
+      if (!channel->active)
+	continue;
+      uet_rx_release_process (vlib_get_main_by_index (uw->thread_index), uw, channel);
+      if (!(clib_atomic_load_acq_n (&channel->svm_header->client_flags) &
+	    UET_VPP_SVM_CLIENT_F_DMA_READY))
+	continue;
+      if (selected)
+	{
+	  *ambiguous = 1;
+	  return 0;
+	}
+      selected = channel;
+    }
+  return selected;
+}
+
 static_always_inline uword
 uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_vectors, u8 is_ip4,
 		   u8 is_udp)
 {
   uet_main_t *um = &uet_main;
   uet_worker_t *uw = 0;
+  uet_worker_channel_t *channel = 0;
   u32 drop_buffers[VLIB_FRAME_SIZE];
   u32 n_drop = 0;
   u64 bytes = 0;
+  u8 ambiguous = 0;
   uet_trace_state_t trace_state = { 0 };
 
   if (PREDICT_TRUE (um->enabled && vm->thread_index > 0 &&
 		    vm->thread_index < vec_len (um->workers)))
     {
       uw = vec_elt_at_index (um->workers, vm->thread_index);
-      if (PREDICT_TRUE (uw->svm_attached))
-	uet_rx_release_process (vm, uw);
+      channel = uet_rx_channel_select (uw, &ambiguous);
       for (u32 i = 0; i < n_vectors; i++)
 	bytes += uet_rx_ip_packet_length (vm, vlib_get_buffer (vm, from[i]), is_ip4);
 
@@ -651,11 +689,9 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 	  uw->rx_ip6_bytes += bytes;
 	}
 
-      if (PREDICT_TRUE (uw->svm_attached &&
-			(clib_atomic_load_acq_n (&uw->svm_header->client_flags) &
-			 UET_VPP_SVM_CLIENT_F_DMA_READY)))
+      if (PREDICT_TRUE (channel != 0))
 	{
-	  uet_vpp_svm_spsc_ring_t *ring = uw->rx_ring;
+	  uet_vpp_svm_spsc_ring_t *ring = channel->rx_ring;
 	  u32 producer = clib_atomic_load_relax_n (&ring->producer);
 	  u32 consumer = clib_atomic_load_acq_n (&ring->consumer);
 
@@ -667,7 +703,7 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 	      u32 token;
 	      u64 rx_id;
 
-	      if (PREDICT_FALSE (producer - consumer >= ring->size || !uw->rx_free_count))
+	      if (PREDICT_FALSE (producer - consumer >= ring->size || !channel->rx_free_count))
 		{
 		  uw->rx_ring_full++;
 		  buffer->error = node->errors[UET_LOCAL_ERROR_RING_FULL];
@@ -679,7 +715,7 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 		  continue;
 		}
 
-	      token = uw->rx_free_slots[uw->rx_free_count - 1];
+	      token = channel->rx_free_slots[channel->rx_free_count - 1];
 	      if (PREDICT_FALSE (
 		    !uet_rx_descriptor_build (vm, um, buffer, token, is_ip4, is_udp, &descriptor)))
 		{
@@ -693,15 +729,16 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 		  continue;
 		}
 
-	      rx_id = uw->next_rx_id++;
+	      rx_id = channel->next_rx_id++;
 	      if (PREDICT_FALSE (!rx_id))
-		rx_id = uw->next_rx_id++;
+		rx_id = channel->next_rx_id++;
 	      descriptor.rx_id = rx_id;
-	      clib_memcpy_fast (uw->rx_descs + uet_spsc_index (ring, producer), &descriptor,
+	      clib_memcpy_fast (channel->rx_descs + uet_spsc_index (ring, producer), &descriptor,
 				sizeof (descriptor));
-	      uw->rx_free_count--;
-	      uw->rx_ids[token] = rx_id;
-	      uw->rx_buffer_indices[token] = buffer_index;
+	      channel->rx_free_count--;
+	      channel->rx_ids[token] = rx_id;
+	      channel->rx_buffer_indices[token] = buffer_index;
+	      channel->rx_outstanding++;
 	      uw->rx_outstanding++;
 	      uw->rx_delivered++;
 	      uet_trace_add (vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, rx_id,
@@ -715,15 +752,19 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 	}
       else
 	{
+	  if (ambiguous)
+	    uw->rx_ambiguous += n_vectors;
 	  for (u32 i = 0; i < n_vectors; i++)
 	    {
 	      vlib_buffer_t *buffer = vlib_get_buffer (vm, from[i]);
 
-	      buffer->error = node->errors[UET_LOCAL_ERROR_NO_CLIENT];
+	      buffer->error = node->errors[ambiguous ? UET_LOCAL_ERROR_AMBIGUOUS_CLIENT :
+						       UET_LOCAL_ERROR_NO_CLIENT];
 	      uet_trace_add (vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, 0,
 			     uet_rx_ip_packet_length (vm, buffer, is_ip4),
 			     vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */, is_ip4 ? 4 : 6,
-			     is_udp, UET_TRACE_RX_NO_CLIENT, 0);
+			     is_udp,
+			     ambiguous ? UET_TRACE_RX_AMBIGUOUS_CLIENT : UET_TRACE_RX_NO_CLIENT, 0);
 	      drop_buffers[n_drop++] = from[i];
 	    }
 	}
@@ -920,6 +961,9 @@ format_uet_trace (u8 *s, va_list *args)
       break;
     case UET_TRACE_RX_NO_CLIENT:
       disposition = "drop-no-client";
+      break;
+    case UET_TRACE_RX_AMBIGUOUS_CLIENT:
+      disposition = "drop-ambiguous-client";
       break;
     case UET_TRACE_RX_RING_FULL:
       disposition = "drop-ring-full";

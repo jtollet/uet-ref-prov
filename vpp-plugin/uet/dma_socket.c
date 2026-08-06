@@ -19,19 +19,30 @@ typedef struct
 } uet_dma_peer_credentials_t;
 
 static int
-uet_dma_peer_authorize (clib_socket_t *client, uet_dma_peer_credentials_t *credentials)
+uet_dma_peer_authorize (clib_socket_t *socket, uet_dma_peer_credentials_t *credentials,
+			uet_client_t **authorized_client)
 {
   uet_main_t *um = &uet_main;
+  uet_client_t *candidate;
   socklen_t credentials_length = sizeof (*credentials);
 
-  if (getsockopt (client->fd, SOL_SOCKET, SO_PEERCRED, credentials, &credentials_length) < 0)
+  *authorized_client = 0;
+  if (getsockopt (socket->fd, SOL_SOCKET, SO_PEERCRED, credentials, &credentials_length) < 0)
     return -errno;
   if (credentials_length != sizeof (*credentials) || credentials->pid <= 0)
     return -EACCES;
 
-  if (um->svm_channel_count && um->svm_segment.sh && um->svm_header &&
-      clib_atomic_load_acq_n (&um->svm_segment.sh->ready) &&
-      clib_atomic_load_acq_n (&um->svm_header->owner_pid) == credentials->pid)
+  pool_foreach (candidate, um->clients)
+    if (candidate->segment.sh && candidate->header &&
+	clib_atomic_load_acq_n (&candidate->segment.sh->ready) &&
+	clib_atomic_load_acq_n (&candidate->header->owner_pid) == credentials->pid)
+      {
+	if (*authorized_client)
+	  return -EEXIST;
+	*authorized_client = candidate;
+      }
+
+  if (*authorized_client)
     return 0;
 
   return -EACCES;
@@ -50,6 +61,7 @@ uet_dma_accept_ready (clib_file_t *uf)
   clib_error_t *err;
   clib_error_t *close_err;
   uet_dma_peer_credentials_t credentials = { 0 };
+  uet_client_t *authorized_client = 0;
   int authorization_status;
   int fd = -1;
 
@@ -60,7 +72,7 @@ uet_dma_accept_ready (clib_file_t *uf)
       return err;
     }
 
-  authorization_status = uet_dma_peer_authorize (&client, &credentials);
+  authorization_status = uet_dma_peer_authorize (&client, &credentials, &authorized_client);
   if (authorization_status)
     {
       reply.status = authorization_status;
@@ -68,15 +80,15 @@ uet_dma_accept_ready (clib_file_t *uf)
       uet_log_warn ("rejected DMA client pid %d uid %u gid %u: no matching active SSVM channel",
 		    credentials.pid, credentials.uid, credentials.gid);
     }
-  else if (um->svm_channel_count && um->dma_map_base)
+  else if (authorized_client && um->dma_map_base)
     {
       vlib_buffer_pool_t *bp = vlib_get_buffer_pool (um->vlib_main, um->dma_buffer_pool_index);
       vlib_physmem_map_t *pm = vlib_physmem_get_map (um->vlib_main, bp->physmem_map_index);
 
       reply.status = 0;
-      reply.generation = um->svm_generation;
+      reply.generation = authorized_client->generation;
       reply.map_size = um->dma_map_size;
-      reply.slot_count = um->svm_queue_depth * um->svm_channel_count;
+      reply.slot_count = authorized_client->queue_depth * authorized_client->channel_count;
       reply.buffer_data_size = um->dma_buffer_data_size;
       reply.buffer_pool_index = um->dma_buffer_pool_index;
       fd = pm->fd;
@@ -89,8 +101,9 @@ uet_dma_accept_ready (clib_file_t *uf)
   if (err)
     uet_log_warn ("failed to send DMA mapping metadata: %U", format_clib_error, err);
   else if (fd >= 0)
-    uet_log_debug ("exported DMA map generation %llu, size %llu to pid %d uid %u", reply.generation,
-		   reply.map_size, credentials.pid, credentials.uid);
+    uet_log_debug ("exported DMA map generation %llu, size %llu to pid %d uid %u for %s",
+		   reply.generation, reply.map_size, credentials.pid, credentials.uid,
+		   authorized_client->segment.name);
   close_err = clib_socket_close (&client);
   clib_socket_free (&client);
   if (close_err)

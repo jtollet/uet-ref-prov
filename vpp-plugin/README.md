@@ -86,8 +86,9 @@ Each worker owns its rings, buffer ownership, TX completion state, RX release
 state, counters, and eventually its UET PDC/timer state. There is no mutex in
 the datapath and no SPSC ring is shared between workers.
 
-One SSVM segment uses the configured name and represents one provider process.
-It contains one independent SPSC channel per VPP worker. One
+Each provider process owns one named SSVM segment containing one independent
+SPSC channel per VPP worker. VPP may host several such application segments at
+the same time and polls every active TX channel on its owning worker. One
 `libuet_vpp_client` object maps that segment and the common VPP buffer pool
 once; datapath calls select a channel index. Each channel has one progress
 owner, while different channels can be used concurrently without an internal
@@ -104,6 +105,12 @@ rings and VPP-buffer ownership may have been left in an indeterminate state.
 Delete and recreate the SVM segment before attaching a replacement provider
 after such a crash.
 VPP refuses to delete a segment whose owner process is still alive.
+
+Until endpoint registrations are added to the shared control ABI, RX is
+delivered only when exactly one provider process is ready. If several provider
+processes are ready, VPP drops the packet as ambiguous and increments
+`rx-ambiguous`; it never guesses a destination segment. This is an intentional
+safe intermediate state for the multi-process implementation.
 
 VPP Session Layer and VCL are intentionally absent. The external application
 communicates through SSVM metadata plus shared VPP physmem. The main thread is
@@ -158,8 +165,8 @@ duplicate releases before publishing them.
 
 The Unix-socket filesystem permissions are the first authorization boundary.
 Before passing the physmem file descriptor, the plugin also reads the
-kernel-supplied `SO_PEERCRED` identity and requires the peer PID to match the
-exclusive owner PID in the ready SSVM segment. The client must therefore
+kernel-supplied `SO_PEERCRED` identity and requires the peer PID to match
+exactly one exclusive owner PID among the ready SSVM segments. The client must therefore
 attach its SSVM segment before requesting the DMA mapping. A process that
 merely knows the socket path receives `-EACCES` without an `SCM_RIGHTS`
 descriptor; accepted and rejected attempts are visible in `show uet`.
@@ -214,6 +221,15 @@ uet rx placement entropy-handoff
 uet svm create name uet queue-size 4096
 ```
 
+Create a different segment name for each provider process. When several
+segments exist, deletion names the target explicitly:
+
+```text
+uet svm create name uet-app-a queue-size 4096
+uet svm create name uet-app-b queue-size 4096
+uet svm delete name uet-app-a
+```
+
 This uses IPv4 and IPv6 table 0. Add `uet tx fib ...` before or after `uet
 enable` only to select other tables. The RX placement command is optional;
 `current-worker` is the default.
@@ -231,10 +247,11 @@ show trace
 clear uet counters
 ```
 
-`show uet` gives aggregate and per-worker channel state. Standard node errors
+`show uet` gives aggregate, per-application, and per-worker channel state.
+Standard node errors
 count malformed external TX requests, completion-ring saturation, invalid RX
-releases, absent clients, RX-ring saturation, malformed VLIB chains, and worker
-handoff queue saturation. Packet traces identify direction, worker, native-IP
+releases, absent or ambiguous clients, RX-ring saturation, malformed VLIB
+chains, and worker handoff queue saturation. Packet traces identify direction, worker, native-IP
 versus UDP encapsulation, IP version, packet length, request/RX identifier, and
 delivery/drop disposition. Lifecycle events use the `uet` VPP log class;
 detailed mapping-export messages are emitted only at debug level.
@@ -276,8 +293,10 @@ vpp-plugin/tests/smoke-svm.sh /opt/vpp build/vpp-plugin 2 3
 ```
 
 `smoke-multiworker.sh` has been validated with 1, 2, 4, and 8 workers. It opens
-one external client for the common segment and verifies independent request
-and completion progress plus routed TX buffer replacement on every worker.
+two concurrent provider processes, each with its own multi-worker segment, and
+verifies independent request and completion progress plus routed TX buffer
+replacement on every worker. It also verifies that RX is reported and dropped
+as ambiguous while both processes are ready and no endpoint demux is installed.
 
 `smoke-svm.sh` also connects an unattached process to the DMA socket and
 verifies that it receives `-EACCES` and no file descriptor before exercising

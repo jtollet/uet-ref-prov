@@ -27,10 +27,40 @@ typedef enum
   UET_RX_N_PATHS,
 } uet_rx_path_t;
 
+typedef struct
+{
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
+
+  u8 active;
+  u8 dma_ready_ack;
+  u32 client_index;
+  uet_vpp_svm_shared_header_t *svm_header;
+
+  u32 *dma_buffer_indices;
+  uet_vpp_svm_dma_slot_t *dma_slots;
+  u32 dma_slot_count;
+
+  u64 next_rx_id;
+  u32 *rx_buffer_indices;
+  u64 *rx_ids;
+  u16 *rx_free_slots;
+  u32 rx_free_count;
+  u32 rx_outstanding;
+
+  uet_vpp_svm_spsc_ring_t *tx_ring;
+  uet_vpp_svm_tx_desc_t *tx_descs;
+  uet_vpp_svm_spsc_ring_t *tx_completion_ring;
+  uet_vpp_svm_tx_completion_t *tx_completion_entries;
+  uet_vpp_svm_spsc_ring_t *rx_ring;
+  uet_vpp_svm_rx_desc_t *rx_descs;
+  uet_vpp_svm_spsc_ring_t *rx_release_ring;
+  uet_vpp_svm_rx_release_t *rx_release_entries;
+} uet_worker_channel_t;
+
 /*
- * Each worker owns one independent datapath channel.  The main thread may
- * inspect it only while holding the worker barrier.  No datapath lock is
- * allowed in this structure.
+ * Each worker owns one independent channel for every application segment.
+ * The main thread may change this vector only while holding the worker
+ * barrier. No datapath lock is allowed in this structure.
  */
 typedef struct
 {
@@ -53,24 +83,13 @@ typedef struct
   u64 rx_udp6_packets;
   u64 rx_udp6_bytes;
   u64 rx_delivered;
+  u64 rx_ambiguous;
   u64 rx_ring_full;
   u64 rx_bad_chain;
   u64 rx_releases;
   u64 rx_invalid_releases;
   u64 rx_outstanding;
-  u64 next_rx_id;
-  u32 *rx_buffer_indices;
-  u64 *rx_ids;
-  u16 *rx_free_slots;
-  u32 rx_free_count;
-
-  u8 svm_attached;
-  u8 dma_ready_ack;
-  uet_vpp_svm_shared_header_t *svm_header;
-
-  u32 *dma_buffer_indices;
-  uet_vpp_svm_dma_slot_t *dma_slots;
-  u32 dma_slot_count;
+  uet_worker_channel_t *channels;
 
   /* FIB indices copied from main-thread control state under the barrier. */
   u32 tx_ip4_fib_index;
@@ -79,15 +98,19 @@ typedef struct
   u32 tx_ip6_table_id;
   u8 tx_configured;
 
-  uet_vpp_svm_spsc_ring_t *tx_ring;
-  uet_vpp_svm_tx_desc_t *tx_descs;
-  uet_vpp_svm_spsc_ring_t *tx_completion_ring;
-  uet_vpp_svm_tx_completion_t *tx_completion_entries;
-  uet_vpp_svm_spsc_ring_t *rx_ring;
-  uet_vpp_svm_rx_desc_t *rx_descs;
-  uet_vpp_svm_spsc_ring_t *rx_release_ring;
-  uet_vpp_svm_rx_release_t *rx_release_entries;
 } uet_worker_t;
+
+/* One application process owns one segment with one channel per VPP worker. */
+typedef struct
+{
+  u32 index;
+  ssvm_private_t segment;
+  uet_vpp_svm_shared_header_t *header;
+  uet_vpp_svm_worker_channel_t *shared_channels;
+  u32 channel_count;
+  u32 queue_depth;
+  u64 generation;
+} uet_client_t;
 
 /* Main-thread-owned control state. */
 typedef struct
@@ -106,11 +129,8 @@ typedef struct
   u32 rx_handoff_queue_indices[UET_RX_N_PATHS];
   u8 rx_entropy_handoff;
 
-  ssvm_private_t svm_segment;
-  uet_vpp_svm_shared_header_t *svm_header;
-  uet_vpp_svm_worker_channel_t *svm_channels;
-  u32 svm_channel_count;
-  u32 svm_queue_depth;
+  /* Main-thread-owned pool; pool indices also index worker channel vectors. */
+  uet_client_t *clients;
   u64 svm_generation;
 
   u8 dma_buffer_pool_index;
@@ -147,7 +167,7 @@ extern vlib_node_registration_t uet6_udp_handoff_node;
 
 int uet_enable_disable (u8 enable);
 int uet_svm_create (const char *segment_name, u32 queue_depth);
-int uet_svm_delete (void);
+int uet_svm_delete (const char *segment_name);
 void uet_counters_clear (void);
 clib_error_t *uet_dma_listener_init (void);
 void uet_dma_listener_delete (void);

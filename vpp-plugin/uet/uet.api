@@ -19,11 +19,12 @@ autoreply define uet_svm_create
   u32 queue_depth;
 };
 
-/** Delete the current per-worker SPSC channels. */
+/** Delete one application's per-worker SPSC channels. */
 autoreply define uet_svm_delete
 {
   u32 client_index;
   u32 context;
+  string segment_name[64];
 };
 
 /** Clear the counters maintained by the UET plugin workers. */

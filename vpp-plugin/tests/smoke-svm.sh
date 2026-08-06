@@ -261,7 +261,7 @@ for _ in $(seq 1 100); do
   sleep 0.01
 done
 "${cli[@]}" show uet | tr -d '\r' | grep -q '^rx-outstanding 1$'
-busy_delete_reply=$("${vat2[@]}" uet_svm_delete '{}')
+busy_delete_reply=$("${vat2[@]}" uet_svm_delete "{\"segment_name\":\"$segment_name\"}")
 printf '%s\n' "$busy_delete_reply"
 grep -Eq '"retval":[[:space:]]*-[1-9][0-9]*' <<<"$busy_delete_reply"
 "${cli[@]}" show uet | tr -d '\r' | grep -q '^svm-state attached$'
@@ -272,7 +272,7 @@ owner_probe_pid=
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-owner-dead
 "${cli[@]}" show uet | tr -d '\r' | grep -q "^provider-owner-pid $dead_owner_pid$"
 
-delete_reply=$("${vat2[@]}" uet_svm_delete '{}')
+delete_reply=$("${vat2[@]}" uet_svm_delete "{\"segment_name\":\"$segment_name\"}")
 printf '%s\n' "$delete_reply"
 grep -Eq '"retval":[[:space:]]*0' <<<"$delete_reply"
 "${cli[@]}" show uet | tr -d '\r' | grep -q '^svm-state detached$'
@@ -283,7 +283,7 @@ printf '%s\n' "$create_reply"
 grep -Eq '"retval":[[:space:]]*0' <<<"$create_reply"
 LD_LIBRARY_PATH="$library_path" "$owner_probe_bin" "$segment_name" expect-success
 "${cli[@]}" show uet | tr -d '\r' | grep -q '^provider-owner-pid 0$'
-delete_reply=$("${vat2[@]}" uet_svm_delete '{}')
+delete_reply=$("${vat2[@]}" uet_svm_delete "{\"segment_name\":\"$segment_name\"}")
 printf '%s\n' "$delete_reply"
 grep -Eq '"retval":[[:space:]]*0' <<<"$delete_reply"
 "${cli[@]}" uet disable
