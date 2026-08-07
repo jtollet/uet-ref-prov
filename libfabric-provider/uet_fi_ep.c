@@ -181,10 +181,12 @@ static int uet_fi_ep_setopt(fid_t fid, int level, int optname,
 			    const void *optval, size_t optlen)
 {
 	struct uet_fi_ep *ep;
+	int rc;
 
 	ep = UET_FI_CONTAINER(fid, struct uet_fi_ep, ep_fid.fid);
-	return ep->domain->fabric->engine.ep_setopt(ep->uet_ep, level, optname,
-						      optval, optlen);
+	rc = ep->domain->fabric->engine.ep_setopt(ep->uet_ep, level, optname,
+						   optval, optlen);
+	return rc == -FI_ENOSYS ? -FI_ENOPROTOOPT : rc;
 }
 
 static int uet_fi_ep_getname(fid_t fid, void *addr, size_t *addrlen)

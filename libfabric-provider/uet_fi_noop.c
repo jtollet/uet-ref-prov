@@ -151,7 +151,7 @@ int uet_fi_no_getopt(fid_t fid, int level, int optname, void *optval,
 {
 	UET_FI_UNUSED(fid); UET_FI_UNUSED(level); UET_FI_UNUSED(optname);
 	UET_FI_UNUSED(optval); UET_FI_UNUSED(optlen);
-	return -FI_ENOSYS;
+	return -FI_ENOPROTOOPT;
 }
 
 int uet_fi_no_tx_ctx(struct fid_ep *sep, int index, struct fi_tx_attr *attr,

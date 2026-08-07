@@ -86,6 +86,8 @@ static int uet_fi_check_hints(const struct fi_info *hints)
 		if (hints->domain_attr->threading != FI_THREAD_UNSPEC &&
 		    hints->domain_attr->threading != FI_THREAD_SAFE &&
 		    hints->domain_attr->threading != FI_THREAD_FID &&
+		    hints->domain_attr->threading != FI_THREAD_DOMAIN &&
+		    hints->domain_attr->threading != FI_THREAD_COMPLETION &&
 		    hints->domain_attr->threading != FI_THREAD_ENDPOINT)
 			return -FI_ENODATA;
 		if (hints->domain_attr->control_progress != FI_PROGRESS_UNSPEC &&

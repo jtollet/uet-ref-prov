@@ -16,12 +16,52 @@
 
 #include "uet_addr.h"
 
+#define UET_PROVIDER_SMOKE_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 static int check(int rc, const char *operation)
 {
 	if (!rc)
 		return 0;
 	fprintf(stderr, "%s: %s (%d)\n", operation, fi_strerror(-rc), rc);
 	return rc;
+}
+
+static int check_threading_hints(const char *node)
+{
+	static const enum fi_threading models[] = {
+		FI_THREAD_SAFE,
+		FI_THREAD_FID,
+		FI_THREAD_DOMAIN,
+		FI_THREAD_COMPLETION,
+		FI_THREAD_ENDPOINT,
+	};
+	struct fi_info *hints;
+	struct fi_info *info;
+	size_t i;
+	int rc;
+
+	for (i = 0; i < UET_PROVIDER_SMOKE_ARRAY_SIZE(models); i++) {
+		hints = fi_allocinfo();
+		if (!hints)
+			return -FI_ENOMEM;
+		hints->caps = FI_MSG | FI_TAGGED;
+		hints->ep_attr->type = FI_EP_RDM;
+		hints->domain_attr->threading = models[i];
+		hints->fabric_attr->prov_name = strdup("uet");
+		if (!hints->fabric_attr->prov_name) {
+			fi_freeinfo(hints);
+			return -FI_ENOMEM;
+		}
+
+		info = NULL;
+		rc = fi_getinfo(FI_VERSION(1, 20), node, NULL, FI_SOURCE,
+				hints, &info);
+		fi_freeinfo(info);
+		fi_freeinfo(hints);
+		if (rc)
+			return rc;
+	}
+
+	return FI_SUCCESS;
 }
 
 int main(int argc, char **argv)
@@ -51,6 +91,11 @@ int main(int argc, char **argv)
 		fprintf(stderr, "usage: %s <local-ip>\n", argv[0]);
 		return 2;
 	}
+
+	fprintf(stderr, "smoke: threading hints\n");
+	rc = check_threading_hints(argv[1]);
+	if (check(rc, "fi_getinfo(threading hints)"))
+		return 1;
 
 	hints = fi_allocinfo();
 	if (!hints)
@@ -90,6 +135,30 @@ int main(int argc, char **argv)
 	rc = fi_endpoint(domain, info, &ep, NULL);
 	if (check(rc, "fi_endpoint"))
 		goto out;
+	{
+		size_t inject_size = 0;
+		size_t optlen = sizeof(inject_size);
+
+		fprintf(stderr, "smoke: unsupported endpoint options\n");
+		rc = fi_getopt(&ep->fid, FI_OPT_ENDPOINT,
+			       FI_OPT_INJECT_MSG_SIZE, &inject_size, &optlen);
+		if (rc != -FI_ENOPROTOOPT) {
+			fprintf(stderr,
+				"fi_getopt(inject size): expected %d, got %d\n",
+				-FI_ENOPROTOOPT, rc);
+			goto out;
+		}
+		rc = fi_setopt(&ep->fid, FI_OPT_ENDPOINT,
+			       FI_OPT_INJECT_MSG_SIZE, &inject_size,
+			       sizeof(inject_size));
+		if (rc != -FI_ENOPROTOOPT) {
+			fprintf(stderr,
+				"fi_setopt(inject size): expected %d, got %d\n",
+				-FI_ENOPROTOOPT, rc);
+			goto out;
+		}
+		rc = FI_SUCCESS;
+	}
 	fprintf(stderr, "smoke: fi_ep_bind(AV)\n");
 	rc = fi_ep_bind(ep, &av->fid, 0);
 	if (check(rc, "fi_ep_bind(AV)"))
