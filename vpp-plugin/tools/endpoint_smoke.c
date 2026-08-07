@@ -33,9 +33,11 @@ typedef enum
   UET_ENDPOINT_ROUTE_RUDI_RESPONSE = 1U << 6,
   UET_ENDPOINT_ROUTE_NACK_RUDI = 1U << 7,
   UET_ENDPOINT_ROUTE_UUD_REQUEST = 1U << 8,
+  UET_ENDPOINT_ROUTE_SNG_REQUEST = 1U << 9,
+  UET_ENDPOINT_ROUTE_SNG_ACK = 1U << 10,
 } uet_endpoint_route_t;
 
-#define UET_ENDPOINT_ROUTE_ALL ((1U << 9) - 1)
+#define UET_ENDPOINT_ROUTE_ALL ((1U << 11) - 1)
 
 static int
 usage (const char *program)
@@ -103,6 +105,24 @@ validate_pdc (const uint8_t *packet, size_t copied, size_t pds_offset, uint16_t 
 }
 
 static int
+validate_sng (const uint8_t *packet, size_t copied, size_t pds_offset, uint16_t expected_namespace,
+	      int ack)
+{
+  uint16_t pid, index;
+
+  if (copied < pds_offset + 12)
+    return -EPROTO;
+  memcpy (&pid, packet + pds_offset + 8, sizeof (pid));
+  memcpy (&index, packet + pds_offset + 10, sizeof (index));
+  pid = ntohs (pid);
+  index = ntohs (index);
+
+  if (pid != (ack ? expected_namespace : 0) || index != UET_ENDPOINT_SMOKE_RI)
+    return -EPROTO;
+  return 0;
+}
+
+static int
 validate_pkt_id (const uint8_t *packet, size_t copied, size_t pds_offset,
 		 uint16_t expected_namespace)
 {
@@ -153,6 +173,12 @@ validate_rx (const uet_vpp_client_rx_t *rx, uint16_t expected_namespace, uint32_
 	  *route = UET_ENDPOINT_ROUTE_RUD_SYN;
 	  return validate_endpoint (packet, copied, ses_offset, expected_namespace);
 	}
+      memcpy (&value, packet + pds_offset + 10, sizeof (value));
+      if (!(ntohs (value) >> UET_ENDPOINT_SMOKE_PDC_BITS))
+	{
+	  *route = UET_ENDPOINT_ROUTE_SNG_REQUEST;
+	  return validate_sng (packet, copied, pds_offset, expected_namespace, 0);
+	}
       *route = UET_ENDPOINT_ROUTE_RUD_ESTABLISHED;
       return validate_pdc (packet, copied, pds_offset, expected_namespace);
     case 4: /* RUDI request */
@@ -167,6 +193,12 @@ validate_rx (const uet_vpp_client_rx_t *rx, uint16_t expected_namespace, uint32_
     case 7: /* ACK */
     case 8: /* ACK with CC */
     case 9: /* ACK with CCX */
+      memcpy (&value, packet + pds_offset + 8, sizeof (value));
+      if (ntohs (value) == expected_namespace)
+	{
+	  *route = UET_ENDPOINT_ROUTE_SNG_ACK;
+	  return validate_sng (packet, copied, pds_offset, expected_namespace, 1);
+	}
       *route = UET_ENDPOINT_ROUTE_ACK;
       return validate_pdc (packet, copied, pds_offset, expected_namespace);
     case 10: /* NACK */
@@ -239,6 +271,12 @@ main (int argc, char **argv)
     {
       fprintf (stderr, "uet_vpp_client_open failed: %d\n", rc);
       return 1;
+    }
+  rc = uet_vpp_client_set_pds_sng (client, mode == MODE_RECEIVE);
+  if (rc)
+    {
+      fprintf (stderr, "uet_vpp_client_set_pds_sng failed: %d\n", rc);
+      goto done;
     }
   rc = uet_vpp_client_map_dma (client, argv[2]);
   if (rc)

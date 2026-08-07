@@ -1153,6 +1153,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 	vlib_cli_output (vm, "application-%u-queue-depth %u", client->index, client->queue_depth);
 	vlib_cli_output (vm, "application-%u-provider-ready %s", client->index,
 			 ready ? "yes" : "no");
+	vlib_cli_output (vm, "application-%u-pds-mode %s", client->index,
+			 client_flags & UET_VPP_SVM_CLIENT_F_PDS_SNG ? "sng" : "pds");
 	vlib_cli_output (vm, "application-%u-owner-pid %u", client->index, client_owner);
       }
   }

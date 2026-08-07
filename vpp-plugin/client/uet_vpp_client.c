@@ -570,6 +570,22 @@ uet_vpp_client_close (uet_vpp_client_t *client)
 }
 
 int
+uet_vpp_client_set_pds_sng (uet_vpp_client_t *client, int enabled)
+{
+  if (!client)
+    return -EINVAL;
+  if (client->dma_map)
+    return -EBUSY;
+  if (enabled)
+    __atomic_fetch_or (&client->header->client_flags, UET_VPP_SVM_CLIENT_F_PDS_SNG,
+		       __ATOMIC_RELEASE);
+  else
+    __atomic_fetch_and (&client->header->client_flags, ~UET_VPP_SVM_CLIENT_F_PDS_SNG,
+			__ATOMIC_RELEASE);
+  return 0;
+}
+
+int
 uet_vpp_client_map_dma (uet_vpp_client_t *client, const char *socket_path)
 {
   struct sockaddr_un address = { .sun_family = AF_UNIX };

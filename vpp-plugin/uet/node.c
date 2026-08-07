@@ -728,34 +728,53 @@ typedef enum
   UET_LOCAL_N_NEXT,
 } uet_local_next_t;
 
-#define UET_WIRE_PDS_TYPE_MASK	  0xf800
-#define UET_WIRE_PDS_TYPE_SHIFT	  11
-#define UET_WIRE_PDS_NEXT_MASK	  0x0780
-#define UET_WIRE_PDS_NEXT_SHIFT	  7
-#define UET_WIRE_PDS_FLAGS_MASK	  0x007f
-#define UET_WIRE_PDS_RUD_REQ	  2
-#define UET_WIRE_PDS_ROD_REQ	  3
-#define UET_WIRE_PDS_RUDI_REQ	  4
-#define UET_WIRE_PDS_RUDI_RESP	  5
-#define UET_WIRE_PDS_UUD_REQ	  6
-#define UET_WIRE_PDS_ACK	  7
-#define UET_WIRE_PDS_ACK_CC	  8
-#define UET_WIRE_PDS_ACK_CCX	  9
-#define UET_WIRE_PDS_NACK	  10
-#define UET_WIRE_PDS_CTRL	  11
-#define UET_WIRE_PDS_NACK_CCX	  12
-#define UET_WIRE_PDS_RUD_CC_REQ	  13
-#define UET_WIRE_PDS_ROD_CC_REQ	  14
-#define UET_WIRE_PDS_REQ_SYN	  0x04
-#define UET_WIRE_PDS_NACK_RUDI	  0x08
-#define UET_WIRE_SES_REQ_STD	  3
-#define UET_WIRE_SES_RELATIVE	  0x08
-#define UET_WIRE_PDC_HEADER_SIZE  12
-#define UET_WIRE_NACK_HEADER_SIZE 16
-#define UET_WIRE_CTRL_HEADER_SIZE 16
-#define UET_WIRE_RUDI_HEADER_SIZE 8
-#define UET_WIRE_UUD_HEADER_SIZE  4
-#define UET_WIRE_SES_REQ_CMN_SIZE 12
+#define UET_WIRE_PDS_TYPE_MASK	    0xf800
+#define UET_WIRE_PDS_TYPE_SHIFT	    11
+#define UET_WIRE_PDS_NEXT_MASK	    0x0780
+#define UET_WIRE_PDS_NEXT_SHIFT	    7
+#define UET_WIRE_PDS_FLAGS_MASK	    0x007f
+#define UET_WIRE_PDS_RUD_REQ	    2
+#define UET_WIRE_PDS_ROD_REQ	    3
+#define UET_WIRE_PDS_RUDI_REQ	    4
+#define UET_WIRE_PDS_RUDI_RESP	    5
+#define UET_WIRE_PDS_UUD_REQ	    6
+#define UET_WIRE_PDS_ACK	    7
+#define UET_WIRE_PDS_ACK_CC	    8
+#define UET_WIRE_PDS_ACK_CCX	    9
+#define UET_WIRE_PDS_NACK	    10
+#define UET_WIRE_PDS_CTRL	    11
+#define UET_WIRE_PDS_NACK_CCX	    12
+#define UET_WIRE_PDS_RUD_CC_REQ	    13
+#define UET_WIRE_PDS_ROD_CC_REQ	    14
+#define UET_WIRE_PDS_REQ_SYN	    0x04
+#define UET_WIRE_PDS_NACK_RUDI	    0x08
+#define UET_WIRE_SES_REQ_STD	    3
+#define UET_WIRE_SES_RSP	    4
+#define UET_WIRE_SES_RSP_DATA	    5
+#define UET_WIRE_SES_RSP_DATA_SMALL 6
+#define UET_WIRE_SES_RELATIVE	    0x08
+#define UET_WIRE_PDC_HEADER_SIZE    12
+#define UET_WIRE_NACK_HEADER_SIZE   16
+#define UET_WIRE_CTRL_HEADER_SIZE   16
+#define UET_WIRE_RUDI_HEADER_SIZE   8
+#define UET_WIRE_UUD_HEADER_SIZE    4
+#define UET_WIRE_SES_REQ_CMN_SIZE   12
+#define UET_WIRE_SES_RSP_CMN_SIZE   8
+
+static_always_inline int
+uet_rx_endpoint_key_namespace (uet_main_t *um, const uet_vpp_svm_endpoint_key_t *endpoint,
+			       u32 *client_namespace)
+{
+  clib_bihash_kv_40_8_t kv, result;
+
+  uet_endpoint_bihash_key_init (endpoint, &kv);
+  if (clib_bihash_search_40_8 (&um->endpoint_hash, &kv, &result))
+    return 0;
+  if (!result.value || result.value > UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
+    return 0;
+  *client_namespace = result.value;
+  return 1;
+}
 
 static_always_inline int
 uet_rx_endpoint_namespace (uet_main_t *um, const u8 *ses, u32 available, const void *dst_address,
@@ -764,7 +783,6 @@ uet_rx_endpoint_namespace (uet_main_t *um, const u8 *ses, u32 available, const v
   uet_vpp_svm_endpoint_key_t endpoint = {
     .ip_version = is_ip4 ? 4 : 6,
   };
-  clib_bihash_kv_40_8_t kv, result;
   u16 value16;
   u32 value32;
 
@@ -778,17 +796,70 @@ uet_rx_endpoint_namespace (uet_main_t *um, const u8 *ses, u32 available, const v
   clib_memcpy_fast (&value16, ses + 10, sizeof (value16));
   endpoint.resource_index = clib_net_to_host_u16 (value16) & 0x0fff;
   clib_memcpy_fast (endpoint.ip_address, dst_address, is_ip4 ? 4 : 16);
-  uet_endpoint_bihash_key_init (&endpoint, &kv);
-  if (clib_bihash_search_40_8 (&um->endpoint_hash, &kv, &result))
+  return uet_rx_endpoint_key_namespace (um, &endpoint, client_namespace);
+}
+
+static_always_inline int
+uet_rx_sng_ack_namespace (uet_main_t *um, const u8 *pds, u32 available, const void *dst_address,
+			  u8 is_ip4, u8 next_header, u32 *client_namespace)
+{
+  uet_vpp_svm_endpoint_key_t endpoint = {
+    .ip_version = is_ip4 ? 4 : 6,
+  };
+  const u8 *ses = pds + UET_WIRE_PDC_HEADER_SIZE;
+  u16 value16;
+  u32 value32;
+
+  if ((next_header != UET_WIRE_SES_RSP && next_header != UET_WIRE_SES_RSP_DATA &&
+       next_header != UET_WIRE_SES_RSP_DATA_SMALL) ||
+      available < UET_WIRE_PDC_HEADER_SIZE + UET_WIRE_SES_RSP_CMN_SIZE)
     return 0;
-  if (!result.value || result.value > UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
+  clib_memcpy_fast (&value16, pds + 8, sizeof (value16));
+  endpoint.pid_on_fep = clib_net_to_host_u16 (value16) & 0x0fff;
+  clib_memcpy_fast (&value16, pds + 10, sizeof (value16));
+  endpoint.resource_index = clib_net_to_host_u16 (value16) & 0x0fff;
+  clib_memcpy_fast (&value32, ses + 4, sizeof (value32));
+  endpoint.job_id = clib_net_to_host_u32 (value32) & 0x00ffffff;
+  clib_memcpy_fast (endpoint.ip_address, dst_address, is_ip4 ? 4 : 16);
+
+  /* SES responses do not repeat the request's relative-addressing bit. */
+  if (uet_rx_endpoint_key_namespace (um, &endpoint, client_namespace))
+    return 1;
+  endpoint.absolute = 1;
+  endpoint.job_id = 0;
+  return uet_rx_endpoint_key_namespace (um, &endpoint, client_namespace);
+}
+
+static_always_inline int
+uet_rx_namespace_mode (uet_worker_t *uw, u32 client_namespace, u8 *sng)
+{
+  u32 client_index;
+  uet_worker_channel_t *channel;
+
+  if (!client_namespace || client_namespace > UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
     return 0;
-  *client_namespace = result.value;
+  client_index = uet_main.client_by_namespace[client_namespace];
+  if (client_index == UET_INVALID_CLIENT_INDEX || client_index >= vec_len (uw->channels))
+    return 0;
+  channel = uw->channels + client_index;
+  if (!channel->active)
+    return 0;
+  *sng =
+    !!(clib_atomic_load_acq_n (&channel->svm_header->client_flags) & UET_VPP_SVM_CLIENT_F_PDS_SNG);
   return 1;
 }
 
 static_always_inline int
-uet_rx_packet_namespace (vlib_buffer_t *buffer, u8 is_ip4, u8 is_udp, u32 *client_namespace)
+uet_rx_namespace_uses_sng (uet_worker_t *uw, u32 client_namespace)
+{
+  u8 sng;
+
+  return uet_rx_namespace_mode (uw, client_namespace, &sng) && sng;
+}
+
+static_always_inline int
+uet_rx_packet_namespace (uet_worker_t *uw, vlib_buffer_t *buffer, u8 is_ip4, u8 is_udp,
+			 u32 *client_namespace)
 {
   uet_main_t *um = &uet_main;
   u8 *start = buffer->data + vnet_buffer (buffer)->l3_hdr_offset;
@@ -843,6 +914,22 @@ uet_rx_packet_namespace (vlib_buffer_t *buffer, u8 is_ip4, u8 is_udp, u32 *clien
 	return 0;
       if (!(flags & UET_WIRE_PDS_REQ_SYN))
 	{
+	  u32 endpoint_namespace;
+
+	  /* SNG has no PDC setup and carries the destination endpoint in
+	   * every standard SES request. Real PDS retains the constant-time
+	   * namespaced-PDC path below.
+	   */
+	  if ((type == UET_WIRE_PDS_RUD_REQ || type == UET_WIRE_PDS_ROD_REQ) &&
+	      next_header == UET_WIRE_SES_REQ_STD &&
+	      uet_rx_endpoint_namespace (um, pds + UET_WIRE_PDC_HEADER_SIZE,
+					 available - UET_WIRE_PDC_HEADER_SIZE, dst_address, is_ip4,
+					 &endpoint_namespace) &&
+	      uet_rx_namespace_uses_sng (uw, endpoint_namespace))
+	    {
+	      *client_namespace = endpoint_namespace;
+	      return 1;
+	    }
 	  clib_memcpy_fast (&pdc_id, pds + 10, sizeof (pdc_id));
 	  *client_namespace = clib_net_to_host_u16 (pdc_id) >> UET_VPP_SVM_PDC_LOCAL_BITS;
 	  return *client_namespace != 0;
@@ -856,6 +943,31 @@ uet_rx_packet_namespace (vlib_buffer_t *buffer, u8 is_ip4, u8 is_udp, u32 *clien
       return uet_rx_endpoint_namespace (um, pds + l4_offset, available - l4_offset, dst_address,
 					is_ip4, client_namespace);
     case UET_WIRE_PDS_ACK:
+      if (available < UET_WIRE_PDC_HEADER_SIZE)
+	return 0;
+      {
+	u32 pds_namespace, sng_namespace;
+	u8 pds_is_sng;
+
+	clib_memcpy_fast (&pdc_id, pds + 10, sizeof (pdc_id));
+	pds_namespace = clib_net_to_host_u16 (pdc_id) >> UET_VPP_SVM_PDC_LOCAL_BITS;
+
+	if (uet_rx_sng_ack_namespace (um, pds, available, dst_address, is_ip4, next_header,
+				      &sng_namespace) &&
+	    uet_rx_namespace_uses_sng (uw, sng_namespace))
+	  {
+	    /* A real-PDS ACK can coincidentally resemble the SNG overlay. Never
+	     * choose between two live applications arbitrarily.
+	     */
+	    if (pds_namespace != sng_namespace &&
+		uet_rx_namespace_mode (uw, pds_namespace, &pds_is_sng) && !pds_is_sng)
+	      return 0;
+	    *client_namespace = sng_namespace;
+	    return 1;
+	  }
+	*client_namespace = pds_namespace;
+      }
+      return *client_namespace != 0;
     case UET_WIRE_PDS_ACK_CC:
     case UET_WIRE_PDS_ACK_CCX:
       if (available < UET_WIRE_PDC_HEADER_SIZE)
@@ -947,7 +1059,7 @@ uet_rx_channel_select (uet_worker_t *uw, vlib_buffer_t *buffer, u8 is_ip4, u8 is
     return single_channel;
 
   *ambiguous = 1;
-  if (!uet_rx_packet_namespace (buffer, is_ip4, is_udp, &client_namespace) ||
+  if (!uet_rx_packet_namespace (uw, buffer, is_ip4, is_udp, &client_namespace) ||
       client_namespace > UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
     return 0;
   client_index = uet_main.client_by_namespace[client_namespace];

@@ -146,14 +146,14 @@ sufficient for serialized control only because configuration callbacks run on
 that thread and use worker barriers; it is not used to serialize datapath
 access.
 
-## Shared ABI 4.1
+## Shared ABI 4.2
 
 The ABI is defined in [`uet/svm_abi.h`](uet/svm_abi.h). Structures use fixed
 width fields and offsets from a mapping base; process pointers never cross the
 boundary. A major version mismatch is rejected. New trailing fields require a
 minor version bump.
 
-ABI 4.1 contains the production SPSC dataplane plus a low-rate endpoint control
+ABI 4.2 contains the production SPSC dataplane plus a low-rate endpoint control
 channel:
 
 - lockless TX and TX-completion rings;
@@ -165,7 +165,9 @@ channel:
   mutex;
 - one request/completion SPSC pair per application segment for endpoint add and
   delete operations; and
-- a nonzero 10-bit process namespace assigned by VPP.
+- a nonzero 10-bit process namespace assigned by VPP; and
+- an application mode flag that lets RX demultiplex both real PDS identifiers
+  and the endpoint overlay used by the stop-and-go implementation.
 
 The client library serializes endpoint control operations with one mutex. This
 does not affect TX, RX, completion, or release rings. VPP worker 0 consumes the
@@ -173,6 +175,12 @@ control requests and updates a shared bihash; all workers perform lockless RX
 lookups. Namespaces are not reused during a VPP lifetime, preventing delayed
 packets from being redirected to a newly created process. Consequently, the
 current ABI permits 1023 segment creations before VPP must be restarted.
+
+The VPP NIC shim declares the selected PDS implementation before mapping DMA.
+Real PDS continues to use namespaced PDC and RUDI identifiers. SNG keeps its
+existing endpoint overlay unchanged; VPP resolves standard requests and ACKs
+against the registered endpoint key. `show uet` reports the mode for each
+application segment.
 
 The experimental `svm_msg_q` request path, payload verifier and fixed SSVM
 payload pool present in ABI 2.x have been removed. SSVM remains responsible
@@ -231,7 +239,7 @@ The zero-copy boundaries are therefore:
 
 The client still uses VPP's SSVM attach API and must be built against a
 compatible VPP SDK. The packet-channel layout itself is defined by
-`uet/svm_abi.h` and checked as ABI 4.1 when a client opens a channel set. The
+`uet/svm_abi.h` and checked as ABI 4.2 when a client opens a channel set. The
 plugin also declares the required `VPP_BUILD_VER`, so VPP rejects an
 incompatible binary at load time.
 
@@ -344,7 +352,7 @@ replacement on every worker. It also verifies safe ambiguous-packet rejection,
 cross-process endpoint-collision detection, cleanup after an owner crash, and
 exact delivery to the respective SVM segment for RUD SYN and established
 traffic, ACK, PDC and RUDI NACK, CTRL, RUDI request/response, and UUD request
-packets.
+packets. It also exercises the stop-and-go request and ACK endpoint overlay.
 
 `smoke-svm.sh` also connects an unattached process to the DMA socket and
 verifies that it receives `-EACCES` and no file descriptor before exercising

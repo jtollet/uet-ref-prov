@@ -63,6 +63,7 @@ struct vpp_data {
 	pthread_mutex_t rx_lock;
 	bool rx_lock_initialized;
 	bool dma_mapped;
+	bool pds_sng;
 	uet_vpp_client_info_t info;
 	_Atomic uint64_t rudi_last_sequence_plus_one;
 };
@@ -400,6 +401,10 @@ static int nic_vpp_translate_ids(struct uet_nic *nic, void *iphdr,
 		return 0;
 	if (rc)
 		return rc;
+
+	/* SNG repurposes spdcid/dpdcid as an endpoint-address overlay. */
+	if (vdata->pds_sng)
+		return 0;
 
 	switch (view.type) {
 	case UET_PDS_TYPE_RUD_REQ:
@@ -1102,6 +1107,7 @@ int nic_vpp_initialize(struct uet_nic *nic)
 	const char *segment_name = getenv(UET_VPP_SEGMENT);
 	const char *dma_socket = getenv(UET_VPP_DMA_SOCKET);
 	const char *ifname = getenv(UET_IFNAME);
+	const char *pds = getenv(UET_PDS);
 	struct vpp_data *vdata;
 	int rc;
 
@@ -1113,6 +1119,7 @@ int nic_vpp_initialize(struct uet_nic *nic)
 	vdata = calloc(1, sizeof(*vdata));
 	if (!vdata)
 		return -ENOMEM;
+	vdata->pds_sng = !pds || strcmp(pds, "sng") == 0;
 	atomic_init(&vdata->rudi_last_sequence_plus_one, 0);
 	vdata->pending_channel = SIZE_MAX;
 	rc = uet_vpp_client_open(&vdata->client, segment_name,
@@ -1122,6 +1129,9 @@ int nic_vpp_initialize(struct uet_nic *nic)
 			    segment_name, rc);
 		goto err_cleanup;
 	}
+	rc = uet_vpp_client_set_pds_sng(vdata->client, vdata->pds_sng);
+	if (rc)
+		goto err_cleanup;
 	if (!vdata->info.channel_count ||
 	    vdata->info.channel_count > UET_VPP_MAX_CHANNELS) {
 		rc = -EPROTO;

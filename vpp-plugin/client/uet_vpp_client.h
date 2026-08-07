@@ -118,6 +118,7 @@ extern "C"
   int uet_vpp_client_open (uet_vpp_client_t **client, const char *segment_name,
 			   uet_vpp_client_info_t *info);
   int uet_vpp_client_close (uet_vpp_client_t *client);
+  int uet_vpp_client_set_pds_sng (uet_vpp_client_t *client, int enabled);
   int uet_vpp_client_map_dma (uet_vpp_client_t *client, const char *socket_path);
   int uet_vpp_client_endpoint_add (uet_vpp_client_t *client,
 				   const uet_vpp_client_endpoint_t *endpoint);

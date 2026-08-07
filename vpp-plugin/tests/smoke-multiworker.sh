@@ -249,6 +249,8 @@ printf -v pdc_a_hex '%04x' "$(((namespace_a << 6) | 1))"
 printf -v pdc_b_hex '%04x' "$(((namespace_b << 6) | 1))"
 printf -v pkt_a_hex '%08x' "$(((namespace_a << 22) | 1))"
 printf -v pkt_b_hex '%08x' "$(((namespace_b << 22) | 1))"
+printf -v sng_pid_a_hex '%04x' "$namespace_a"
+printf -v sng_pid_b_hex '%04x' "$namespace_b"
 
 inject_endpoint_packet()
 {
@@ -280,6 +282,7 @@ inject_endpoint_routes()
   local pdc_hex=$3
   local pkt_hex=$4
   local port_base=$5
+  local sng_pid_hex=$6
   local ses="0008000100000000${pid_hex}000f"
 
   inject_endpoint_packet "uet-$label-rud-syn" "$((port_base + 0))" 52 \
@@ -300,10 +303,16 @@ inject_endpoint_routes()
     "50080100${pkt_hex}0000000000000000"
   inject_endpoint_packet "uet-$label-uud-request" "$((port_base + 8))" 44 \
     "31800000${ses}"
+  inject_endpoint_packet "uet-$label-sng-request" "$((port_base + 9))" 52 \
+    "11880000000000a70000000f${ses}"
+  inject_endpoint_packet "uet-$label-sng-ack" "$((port_base + 10))" 48 \
+    "3a000000000000a8${sng_pid_hex}000f0000000100000000"
 }
 
-inject_endpoint_routes endpoint-a "$pid_a_hex" "$pdc_a_hex" "$pkt_a_hex" 10000
-inject_endpoint_routes endpoint-b "$pid_b_hex" "$pdc_b_hex" "$pkt_b_hex" 10016
+inject_endpoint_routes endpoint-a "$pid_a_hex" "$pdc_a_hex" "$pkt_a_hex" 10000 \
+  "$sng_pid_a_hex"
+inject_endpoint_routes endpoint-b "$pid_b_hex" "$pdc_b_hex" "$pkt_b_hex" 10016 \
+  "$sng_pid_b_hex"
 if ! wait "$endpoint_pid_a"; then
   endpoint_pid_a=
   cat "$runtime_dir/endpoint-a.log" >&2
@@ -319,9 +328,9 @@ endpoint_pid_b=
 grep -q "^endpoint RX namespace $namespace_a passed$" "$runtime_dir/endpoint-a.log"
 grep -q "^endpoint RX namespace $namespace_b passed$" "$runtime_dir/endpoint-b.log"
 status=$("${cli[@]}" show uet | tr -d '\r')
-grep -q '^rx-delivered 18$' <<<"$status"
+grep -q '^rx-delivered 22$' <<<"$status"
 grep -q '^rx-ambiguous 0$' <<<"$status"
-grep -q '^rx-releases 18$' <<<"$status"
+grep -q '^rx-releases 22$' <<<"$status"
 grep -q '^endpoint-registrations 0$' <<<"$status"
 
 "${cli[@]}" uet svm delete name "$segment_name_a"
