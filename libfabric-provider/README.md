@@ -57,6 +57,12 @@ well.
 The provider itself links only to libfabric, pthreads, and `libdl`. Backend
 dependencies remain in their engine libraries.
 
+An engine may optionally expose backend-neutral callbacks to finish local
+address configuration and register or unregister an endpoint for RX delivery.
+The provider only calls callbacks that the selected engine exports. The
+raw-socket and AF_XDP engines export none and retain their existing behavior;
+the VPP engine uses them to exchange endpoint identities with VPP.
+
 ## Run an unchanged libfabric application
 
 Point libfabric at the external provider, make the selected engine visible to
@@ -81,6 +87,13 @@ channel count from ABI metadata. TX selects a stable channel from the IP
 addresses and UET EV (native entropy value or UDP source port); RX polls the
 worker channels fairly. A single-worker segment preserves the existing
 behavior.
+
+VPP assigns a namespace to each provider process. Endpoint creation and close
+automatically register and unregister the endpoint's complete RX identity over
+the SVM control channel; the application and the standard libfabric API remain
+unchanged. Multiple applications, or one application with multiple endpoints,
+can therefore share the same VPP instance while VPP delivers each packet to
+the owning application segment and retains its per-worker datapath scaling.
 
 ## Tests
 

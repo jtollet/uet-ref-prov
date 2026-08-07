@@ -24,6 +24,12 @@ static int uet_fi_ep_close(struct fid *fid)
 		pthread_mutex_unlock(&ep->domain->control_lock);
 		return rc;
 	}
+	if (ep->domain->fabric->engine.endpoint_unregister &&
+	    ep->engine_endpoint_context) {
+		ep->domain->fabric->engine.endpoint_unregister(
+			ep->engine_endpoint_context);
+		ep->engine_endpoint_context = NULL;
+	}
 
 	for (mr = ep->mrs; mr; mr = next) {
 		next = mr->ep_next;
@@ -628,8 +634,13 @@ int uet_fi_endpoint_open(struct fid_domain *domain_fid, struct fi_info *info,
 	rc = domain->fabric->engine.endpoint(domain->uet_domain,
 					     ep->engine_info, &ep->ep_fid,
 					     context, &ep->uet_ep);
+	if (!rc && domain->fabric->engine.endpoint_register)
+		rc = domain->fabric->engine.endpoint_register(
+			ep->uet_ep, &ep->engine_endpoint_context);
 	pthread_mutex_unlock(&domain->control_lock);
 	if (rc) {
+		if (ep->uet_ep)
+			domain->fabric->engine.ep_close(ep->uet_ep);
 		fi_freeinfo(ep->engine_info);
 		free(ep);
 		return rc;

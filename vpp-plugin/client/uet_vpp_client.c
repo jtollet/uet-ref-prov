@@ -20,6 +20,13 @@
 
 #include "uet_vpp_client.h"
 
+_Static_assert(UET_VPP_CLIENT_NAMESPACE_BITS == UET_VPP_SVM_CLIENT_NAMESPACE_BITS,
+	       "client and SVM namespace widths differ");
+_Static_assert(UET_VPP_CLIENT_PDC_LOCAL_BITS == UET_VPP_SVM_PDC_LOCAL_BITS,
+	       "client and SVM PDC widths differ");
+_Static_assert(UET_VPP_CLIENT_RUDI_LOCAL_BITS == UET_VPP_SVM_RUDI_LOCAL_BITS,
+	       "client and SVM RUDI widths differ");
+
 #define UET_VPP_CLIENT_HEAP_SIZE       (64U << 20)
 #define UET_VPP_CLIENT_ACK_SPINS       1000000U
 #define UET_VPP_CLIENT_ATTACH_ATTEMPTS 5
@@ -56,6 +63,10 @@ struct uet_vpp_client
   ssvm_private_t segment;
   uet_vpp_svm_shared_header_t *header;
   uet_vpp_svm_worker_channel_t *shared_channels;
+  uet_vpp_svm_spsc_ring_t *control_request_ring;
+  uet_vpp_svm_control_request_t *control_requests;
+  uet_vpp_svm_spsc_ring_t *control_completion_ring;
+  uet_vpp_svm_control_completion_t *control_completions;
   uet_vpp_client_channel_t *channels;
   uint32_t channel_count;
   void *dma_map;
@@ -63,6 +74,9 @@ struct uet_vpp_client
   int dma_fd;
   int owner_fd;
   int owner_claimed;
+  pthread_mutex_t control_mutex;
+  int control_mutex_initialized;
+  uint64_t next_control_request_id;
 };
 
 static pthread_once_t uet_vpp_heap_once = PTHREAD_ONCE_INIT;
@@ -124,6 +138,21 @@ uet_vpp_header_is_compatible (const uet_vpp_svm_shared_header_t *header, uint64_
 			       (uint64_t) header->worker_count * header->worker_channel_desc_size,
 			       header->segment_size) ||
       header->dma_buffer_data_size == 0 || header->dma_map_size == 0)
+    return 0;
+
+  if (!header->client_namespace || header->client_namespace > UET_VPP_SVM_CLIENT_NAMESPACE_MAX ||
+      header->control_ring_size < UET_VPP_SVM_MIN_QUEUE_DEPTH ||
+      header->control_ring_size > UET_VPP_SVM_MAX_QUEUE_DEPTH ||
+      !uet_vpp_range_is_valid (header->control_request_ring_offset,
+			       sizeof (uet_vpp_svm_spsc_ring_t) +
+				 (uint64_t) header->control_ring_size *
+				   sizeof (uet_vpp_svm_control_request_t),
+			       header->segment_size) ||
+      !uet_vpp_range_is_valid (header->control_completion_ring_offset,
+			       sizeof (uet_vpp_svm_spsc_ring_t) +
+				 (uint64_t) header->control_ring_size *
+				   sizeof (uet_vpp_svm_control_completion_t),
+			       header->segment_size))
     return 0;
 
   if (header->tx_desc_size != sizeof (uet_vpp_svm_tx_desc_t) ||
@@ -209,6 +238,25 @@ uet_vpp_client_is_drained (uet_vpp_client_t *client, int require_release_drain)
 	  uint32_t pending = producer - consumer;
 
 	  if (pending > ring->size)
+	    return -EPROTO;
+	  if (pending)
+	    return 0;
+	}
+    }
+  if (client->control_request_ring && client->control_completion_ring)
+    {
+      const uet_vpp_svm_spsc_ring_t *rings[] = {
+	client->control_request_ring,
+	client->control_completion_ring,
+      };
+
+      for (uint32_t i = 0; i < 2; i++)
+	{
+	  uint32_t consumer = __atomic_load_n (&rings[i]->consumer, __ATOMIC_RELAXED);
+	  uint32_t producer = __atomic_load_n (&rings[i]->producer, __ATOMIC_ACQUIRE);
+	  uint32_t pending = producer - consumer;
+
+	  if (pending > rings[i]->size)
 	    return -EPROTO;
 	  if (pending)
 	    return 0;
@@ -387,6 +435,20 @@ uet_vpp_client_open (uet_vpp_client_t **client_out, const char *segment_name,
   client->shared_channels =
     (uet_vpp_svm_worker_channel_t *) ((uint8_t *) client->segment.sh +
 				      client->header->worker_channel_table_offset);
+  client->control_request_ring =
+    (uet_vpp_svm_spsc_ring_t *) ((uint8_t *) client->segment.sh +
+				 client->header->control_request_ring_offset);
+  client->control_requests = (uet_vpp_svm_control_request_t *) (client->control_request_ring + 1);
+  client->control_completion_ring =
+    (uet_vpp_svm_spsc_ring_t *) ((uint8_t *) client->segment.sh +
+				 client->header->control_completion_ring_offset);
+  client->control_completions =
+    (uet_vpp_svm_control_completion_t *) (client->control_completion_ring + 1);
+  if (!uet_vpp_ring_is_compatible (client->control_request_ring,
+				   client->header->control_ring_size) ||
+      !uet_vpp_ring_is_compatible (client->control_completion_ring,
+				   client->header->control_ring_size))
+    goto incompatible;
   rv = posix_memalign ((void **) &client->channels, UET_VPP_SVM_SHARED_ALIGNMENT,
 		       client->channel_count * sizeof (*client->channels));
   if (rv)
@@ -427,11 +489,17 @@ uet_vpp_client_open (uet_vpp_client_t **client_out, const char *segment_name,
 	  !uet_vpp_ring_is_compatible (channel->rx_release_ring, shared->rx_ring_size))
 	goto incompatible;
     }
+  rv = pthread_mutex_init (&client->control_mutex, 0);
+  if (rv)
+    goto incompatible;
+  client->control_mutex_initialized = 1;
+  client->next_control_request_id = 1;
   if (info)
     {
       info->abi_major = client->header->abi_major;
       info->abi_minor = client->header->abi_minor;
       info->channel_count = client->channel_count;
+      info->client_namespace = client->header->client_namespace;
       info->queue_depth = client->header->queue_depth;
       info->dma_slot_count = client->header->queue_depth;
       info->dma_buffer_data_size = client->header->dma_buffer_data_size;
@@ -445,6 +513,8 @@ uet_vpp_client_open (uet_vpp_client_t **client_out, const char *segment_name,
   return 0;
 
 incompatible:
+  if (client->control_mutex_initialized)
+    pthread_mutex_destroy (&client->control_mutex);
   uet_vpp_client_channels_free (client);
   uet_vpp_client_unmap (client);
   free (client);
@@ -491,6 +561,8 @@ uet_vpp_client_close (uet_vpp_client_t *client)
     munmap (client->dma_map, client->header->dma_map_size);
   if (client->dma_fd >= 0)
     close (client->dma_fd);
+  if (client->control_mutex_initialized)
+    pthread_mutex_destroy (&client->control_mutex);
   uet_vpp_client_channels_free (client);
   uet_vpp_client_unmap (client);
   free (client);
@@ -635,6 +707,105 @@ invalid_dma_slot:
   client->dma_map = 0;
   close (received_fd);
   return -EPROTO;
+}
+
+static int
+uet_vpp_client_endpoint_control (uet_vpp_client_t *client, uint16_t operation,
+				 const uet_vpp_client_endpoint_t *endpoint)
+{
+  uet_vpp_svm_spsc_ring_t *request_ring, *completion_ring;
+  uet_vpp_svm_control_request_t *request;
+  uint32_t request_producer, request_consumer, completion_consumer;
+  uint64_t request_id;
+  int lock_rv, rv = -ETIMEDOUT;
+
+  if (!client || !endpoint || (endpoint->ip_version != 4 && endpoint->ip_version != 6) ||
+      endpoint->absolute > 1 || endpoint->pid_on_fep > 0x0fff ||
+      endpoint->resource_index > 0x0fff || endpoint->job_id > 0x00ffffff)
+    return -EINVAL;
+  if (!client->dma_map)
+    return -ENXIO;
+
+  lock_rv = pthread_mutex_lock (&client->control_mutex);
+  if (lock_rv)
+    return -lock_rv;
+
+  request_ring = client->control_request_ring;
+  completion_ring = client->control_completion_ring;
+  request_producer = __atomic_load_n (&request_ring->producer, __ATOMIC_RELAXED);
+  request_consumer = __atomic_load_n (&request_ring->consumer, __ATOMIC_ACQUIRE);
+  completion_consumer = __atomic_load_n (&completion_ring->consumer, __ATOMIC_RELAXED);
+  if (request_producer - request_consumer >= request_ring->size)
+    {
+      rv = -EAGAIN;
+      goto unlock;
+    }
+
+  request_id = client->next_control_request_id++;
+  if (!request_id)
+    request_id = client->next_control_request_id++;
+  request = client->control_requests + (request_ring->mask ? request_producer & request_ring->mask :
+							     request_producer % request_ring->size);
+  memset (request, 0, sizeof (*request));
+  request->request_id = request_id;
+  request->operation = operation;
+  request->endpoint.ip_version = endpoint->ip_version;
+  request->endpoint.absolute = endpoint->absolute;
+  request->endpoint.pid_on_fep = endpoint->pid_on_fep;
+  request->endpoint.resource_index = endpoint->resource_index;
+  request->endpoint.job_id = endpoint->absolute ? 0 : endpoint->job_id;
+  memcpy (request->endpoint.ip_address, endpoint->ip_address,
+	  sizeof (request->endpoint.ip_address));
+  __atomic_store_n (&request_ring->producer, request_producer + 1, __ATOMIC_RELEASE);
+
+  for (uint32_t spin = 0; spin < UET_VPP_CLIENT_ACK_SPINS; spin++)
+    {
+      uint32_t completion_producer = __atomic_load_n (&completion_ring->producer, __ATOMIC_ACQUIRE);
+      uint32_t available = completion_producer - completion_consumer;
+
+      if (available > completion_ring->size)
+	{
+	  rv = -EPROTO;
+	  break;
+	}
+      if (available)
+	{
+	  uet_vpp_svm_control_completion_t *completion =
+	    client->control_completions + (completion_ring->mask ?
+					     completion_consumer & completion_ring->mask :
+					     completion_consumer % completion_ring->size);
+
+	  if (completion->request_id != request_id || completion->reserved0 ||
+	      completion->reserved1[0] || completion->reserved1[1])
+	    rv = -EPROTO;
+	  else
+	    rv = completion->status;
+	  __atomic_store_n (&completion_ring->consumer, completion_consumer + 1, __ATOMIC_RELEASE);
+	  break;
+	}
+      if (!__atomic_load_n (&client->segment.sh->ready, __ATOMIC_ACQUIRE))
+	{
+	  rv = -ECONNRESET;
+	  break;
+	}
+      sched_yield ();
+    }
+
+unlock:
+  pthread_mutex_unlock (&client->control_mutex);
+  return rv;
+}
+
+int
+uet_vpp_client_endpoint_add (uet_vpp_client_t *client, const uet_vpp_client_endpoint_t *endpoint)
+{
+  return uet_vpp_client_endpoint_control (client, UET_VPP_SVM_CONTROL_ENDPOINT_ADD, endpoint);
+}
+
+int
+uet_vpp_client_endpoint_del (uet_vpp_client_t *client, const uet_vpp_client_endpoint_t *endpoint)
+{
+  return uet_vpp_client_endpoint_control (client, UET_VPP_SVM_CONTROL_ENDPOINT_DEL, endpoint);
 }
 
 int

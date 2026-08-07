@@ -9,8 +9,10 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/udp.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,7 +24,9 @@
 
 #include "uet_api.h"
 #include "uet_api_private.h"
+#include "uet_pkt_hdr.h"
 #include "uet_nic.h"
+#include "crc32c.h"
 
 #define UET_NETWORK_TYPE_VPP "VPP"
 #define UET_VPP_TX_BATCH_SIZE 64
@@ -30,6 +34,14 @@
 #define UET_VPP_MAX_CHANNELS 256
 #define UET_VPP_CHANNEL_ALIGNMENT 64
 #define UET_VPP_CLOSE_TIMEOUT_NS (5ULL * 1000 * 1000 * 1000)
+#define UET_VPP_INITIATOR_LOCAL_BITS 22
+#define UET_VPP_INITIATOR_LOCAL_MASK \
+	((1U << UET_VPP_INITIATOR_LOCAL_BITS) - 1)
+
+struct vpp_endpoint_registration {
+	struct vpp_data *vdata;
+	uet_vpp_client_endpoint_t endpoint;
+};
 
 struct __attribute__((aligned(UET_VPP_CHANNEL_ALIGNMENT))) vpp_channel {
 	uet_vpp_client_t *client;
@@ -52,6 +64,18 @@ struct vpp_data {
 	bool rx_lock_initialized;
 	bool dma_mapped;
 	uet_vpp_client_info_t info;
+	_Atomic uint64_t rudi_last_sequence_plus_one;
+};
+
+struct nic_vpp_packet_view {
+	uint8_t *ip;
+	uint8_t *pds;
+	size_t ip_length;
+	size_t pds_length;
+	uint8_t type;
+	uint8_t next_header;
+	uint8_t flags;
+	bool is_ipv6;
 };
 
 static int nic_vpp_monotonic_ns(uint64_t *now)
@@ -169,6 +193,344 @@ static int nic_vpp_ip_length(void *iphdr, size_t available,
 	return 0;
 }
 
+static int nic_vpp_packet_view(struct uet_nic *nic, void *iphdr,
+			       size_t available,
+			       struct nic_vpp_packet_view *view)
+{
+	struct uet_pds_prlg *prologue;
+	uint16_t type_next_flags;
+	uint8_t protocol;
+	size_t offset;
+	int rc;
+
+	memset(view, 0, sizeof(*view));
+	rc = nic_vpp_ip_length(iphdr, available, &view->ip_length);
+	if (rc)
+		return rc;
+	view->ip = iphdr;
+	view->is_ipv6 = (view->ip[0] >> 4) == 6;
+	if (view->is_ipv6) {
+		struct ipv6hdr *ipv6 = iphdr;
+
+		protocol = ipv6->nexthdr;
+		offset = sizeof(*ipv6);
+	} else {
+		struct iphdr *ipv4 = iphdr;
+
+		protocol = ipv4->protocol;
+		offset = ipv4->ihl << 2;
+	}
+	if (protocol == nic->uet_ipproto)
+		offset += sizeof(struct uet_entropy);
+	else if (protocol == IPPROTO_UDP)
+		offset += sizeof(struct udphdr);
+	else
+		return -EPROTONOSUPPORT;
+	if (offset + sizeof(*prologue) > view->ip_length)
+		return -EINVAL;
+
+	view->pds = view->ip + offset;
+	prologue = (struct uet_pds_prlg *)view->pds;
+	type_next_flags = ntohs(prologue->type_next_flags);
+	view->type = (type_next_flags & UET_PDS_TYPE_MASK) >>
+		     UET_PDS_TYPE_SHIFT;
+	view->next_header = (type_next_flags & UET_PDS_NEXT_HDR_MASK) >>
+			    UET_PDS_NEXT_HDR_SHIFT;
+	view->flags = type_next_flags & UET_PDS_FLAGS_MASK;
+
+	switch (view->type) {
+	case UET_PDS_TYPE_RUD_REQ:
+	case UET_PDS_TYPE_ROD_REQ:
+		view->pds_length = sizeof(struct uet_pds_req);
+		break;
+	case UET_PDS_TYPE_RUD_CC_REQ:
+	case UET_PDS_TYPE_ROD_CC_REQ:
+		view->pds_length = sizeof(struct uet_pds_req) +
+				   sizeof(struct uet_pds_req_cc_state);
+		break;
+	case UET_PDS_TYPE_ACK:
+		view->pds_length = sizeof(struct uet_pds_ack);
+		break;
+	case UET_PDS_TYPE_ACK_CC:
+		view->pds_length = sizeof(struct uet_pds_ack_cc);
+		break;
+	case UET_PDS_TYPE_ACK_CCX:
+		view->pds_length = sizeof(struct uet_pds_ack_ccx);
+		break;
+	case UET_PDS_TYPE_NACK:
+		view->pds_length = sizeof(struct uet_pds_nack);
+		break;
+	case UET_PDS_TYPE_NACK_CCX:
+		view->pds_length = sizeof(struct uet_pds_nack_ccx);
+		break;
+	case UET_PDS_TYPE_CTRL:
+		view->pds_length = sizeof(struct uet_pds_ctrl);
+		break;
+	case UET_PDS_TYPE_RUDI_REQ:
+	case UET_PDS_TYPE_RUDI_RESP:
+		view->pds_length = sizeof(struct uet_pds_rudi_req);
+		break;
+	case UET_PDS_TYPE_UUD_REQ:
+		view->pds_length = sizeof(struct uet_pds_uud_req);
+		break;
+	case UET_PDS_TYPE_SECURITY:
+		/* Endpoint demultiplexing cannot inspect encrypted transport
+		 * headers yet. Preserve the historical single-client behavior.
+		 */
+		return -EOPNOTSUPP;
+	default:
+		return -EINVAL;
+	}
+	if (offset + view->pds_length > view->ip_length)
+		return -EINVAL;
+	return 0;
+}
+
+static int nic_vpp_pdc_to_wire(const struct vpp_data *vdata,
+			       uint16_t local_id, uint16_t *wire_id)
+{
+	if (!local_id || local_id > UET_VPP_CLIENT_PDC_LOCAL_MASK)
+		return -ERANGE;
+	*wire_id = ((uint16_t)vdata->info.client_namespace <<
+		    UET_VPP_CLIENT_PDC_LOCAL_BITS) | local_id;
+	return 0;
+}
+
+static int nic_vpp_pdc_from_wire(const struct vpp_data *vdata,
+				 uint16_t wire_id, uint16_t *local_id)
+{
+	if ((wire_id >> UET_VPP_CLIENT_PDC_LOCAL_BITS) !=
+	    vdata->info.client_namespace)
+		return -EPROTO;
+	*local_id = wire_id & UET_VPP_CLIENT_PDC_LOCAL_MASK;
+	return 0;
+}
+
+static int nic_vpp_rudi_to_wire(struct vpp_data *vdata, uint32_t local_id,
+				uint32_t *wire_id)
+{
+	const uint64_t wrap = (uint64_t)UINT32_MAX + 1;
+	uint64_t observed, desired, last, sequence;
+
+	/* The software RUDI allocator is a monotonic uint32_t counter. Keep its
+	 * logical epoch so a response can recover the full ID after only the low
+	 * 22 bits crossed the VPP boundary. No per-packet state is added here.
+	 */
+	observed = atomic_load_explicit(&vdata->rudi_last_sequence_plus_one,
+					memory_order_relaxed);
+	for (;;) {
+		if (!observed) {
+			sequence = local_id;
+			desired = sequence + 1;
+		} else {
+			last = observed - 1;
+			sequence = (last & ~(wrap - 1)) | local_id;
+			if (sequence < last && last - sequence > wrap / 2)
+				sequence += wrap;
+			else if (sequence > last && sequence - last > wrap / 2 &&
+				 sequence >= wrap)
+				sequence -= wrap;
+			if (sequence <= last)
+				break;
+			desired = sequence + 1;
+		}
+		if (atomic_compare_exchange_weak_explicit(
+			    &vdata->rudi_last_sequence_plus_one, &observed,
+			    desired, memory_order_relaxed, memory_order_relaxed))
+			break;
+	}
+	*wire_id = (vdata->info.client_namespace <<
+		    UET_VPP_CLIENT_RUDI_LOCAL_BITS) |
+		   (local_id & UET_VPP_CLIENT_RUDI_LOCAL_MASK);
+	return 0;
+}
+
+static int nic_vpp_rudi_from_wire(struct vpp_data *vdata,
+				  uint32_t wire_id, uint32_t *local_id)
+{
+	const uint64_t span = (uint64_t)1 << UET_VPP_CLIENT_RUDI_LOCAL_BITS;
+	uint64_t last_plus_one, last, sequence;
+
+	if ((wire_id >> UET_VPP_CLIENT_RUDI_LOCAL_BITS) !=
+	    vdata->info.client_namespace)
+		return -EPROTO;
+	last_plus_one = atomic_load_explicit(
+		&vdata->rudi_last_sequence_plus_one, memory_order_relaxed);
+	if (!last_plus_one)
+		return -ENOENT;
+	last = last_plus_one - 1;
+	/* Reconstruction is unambiguous while fewer than one 22-bit span of
+	 * requests are outstanding. The engine queue limits are far below that.
+	 */
+	sequence = (last & ~(span - 1)) |
+		   (wire_id & UET_VPP_CLIENT_RUDI_LOCAL_MASK);
+	if (sequence > last) {
+		if (sequence < span)
+			return -ENOENT;
+		sequence -= span;
+	}
+	*local_id = (uint32_t)sequence;
+	return 0;
+}
+
+static void nic_vpp_update_crc(const struct nic_vpp_packet_view *view)
+{
+	size_t start_offset = view->is_ipv6 ? 8 : 12;
+	uint32_t crc;
+
+	if (view->ip_length < start_offset + CRC_LEN)
+		return;
+	crc = crc32c(view->ip + start_offset,
+		     view->ip_length - start_offset - CRC_LEN);
+	memcpy(view->ip + view->ip_length - CRC_LEN, &crc, CRC_LEN);
+}
+
+static int nic_vpp_translate_ids(struct uet_nic *nic, void *iphdr,
+				 size_t available, bool tx)
+{
+	struct vpp_data *vdata = nic->nic_priv_data;
+	struct nic_vpp_packet_view view;
+	uint16_t value16;
+	uint32_t value32;
+	bool changed = false;
+	int rc;
+
+	rc = nic_vpp_packet_view(nic, iphdr, available, &view);
+	if (rc == -EOPNOTSUPP)
+		return 0;
+	if (rc)
+		return rc;
+
+	switch (view.type) {
+	case UET_PDS_TYPE_RUD_REQ:
+	case UET_PDS_TYPE_ROD_REQ:
+	case UET_PDS_TYPE_RUD_CC_REQ:
+	case UET_PDS_TYPE_ROD_CC_REQ: {
+		struct uet_pds_req *request = (struct uet_pds_req *)view.pds;
+
+		if (tx) {
+			rc = nic_vpp_pdc_to_wire(vdata,
+					     ntohs(request->spdcid), &value16);
+			if (rc)
+				return rc;
+			request->spdcid = htons(value16);
+			changed = true;
+		} else if (!(view.flags & UET_PDS_REQ_FLAGS_SYN)) {
+			rc = nic_vpp_pdc_from_wire(vdata,
+						ntohs(request->dpdcid), &value16);
+			if (rc)
+				return rc;
+			request->dpdcid = htons(value16);
+			changed = true;
+		}
+		break;
+	}
+	case UET_PDS_TYPE_ACK:
+	case UET_PDS_TYPE_ACK_CC:
+	case UET_PDS_TYPE_ACK_CCX: {
+		struct uet_pds_ack *ack = (struct uet_pds_ack *)view.pds;
+
+		if (tx) {
+			rc = nic_vpp_pdc_to_wire(vdata, ntohs(ack->spdcid),
+					     &value16);
+			if (rc)
+				return rc;
+			ack->spdcid = htons(value16);
+		} else {
+			rc = nic_vpp_pdc_from_wire(vdata, ntohs(ack->dpdcid),
+						&value16);
+			if (rc)
+				return rc;
+			ack->dpdcid = htons(value16);
+		}
+		changed = true;
+		break;
+	}
+	case UET_PDS_TYPE_NACK:
+	case UET_PDS_TYPE_NACK_CCX: {
+		struct uet_pds_nack *nack = (struct uet_pds_nack *)view.pds;
+
+		if (view.flags & UET_PDS_NACK_FLAGS_NT) {
+			if (!tx) {
+				rc = nic_vpp_rudi_from_wire(
+					vdata, ntohl(nack->nack_pkt_id), &value32);
+				if (rc)
+					return rc;
+				nack->nack_pkt_id = htonl(value32);
+				changed = true;
+			}
+		} else if (tx) {
+			rc = nic_vpp_pdc_to_wire(vdata, ntohs(nack->spdcid),
+					     &value16);
+			if (rc)
+				return rc;
+			nack->spdcid = htons(value16);
+			changed = true;
+		} else {
+			rc = nic_vpp_pdc_from_wire(vdata, ntohs(nack->dpdcid),
+						&value16);
+			if (rc)
+				return rc;
+			nack->dpdcid = htons(value16);
+			changed = true;
+		}
+		break;
+	}
+	case UET_PDS_TYPE_CTRL: {
+		struct uet_pds_ctrl *control = (struct uet_pds_ctrl *)view.pds;
+
+		if (tx) {
+			rc = nic_vpp_pdc_to_wire(vdata,
+					     ntohs(control->spdcid), &value16);
+			if (rc)
+				return rc;
+			control->spdcid = htons(value16);
+			changed = true;
+		} else if (!(view.flags & UET_PDS_CTRL_FLAGS_SYN)) {
+			rc = nic_vpp_pdc_from_wire(vdata,
+						ntohs(control->dpdcid), &value16);
+			if (rc)
+				return rc;
+			control->dpdcid = htons(value16);
+			changed = true;
+		}
+		break;
+	}
+	case UET_PDS_TYPE_RUDI_REQ:
+		if (tx) {
+			struct uet_pds_rudi_req *rudi =
+				(struct uet_pds_rudi_req *)view.pds;
+
+			rc = nic_vpp_rudi_to_wire(vdata, ntohl(rudi->pkt_id),
+						&value32);
+			if (rc)
+				return rc;
+			rudi->pkt_id = htonl(value32);
+			changed = true;
+		}
+		break;
+	case UET_PDS_TYPE_RUDI_RESP:
+		if (!tx) {
+			struct uet_pds_rudi_req *rudi =
+				(struct uet_pds_rudi_req *)view.pds;
+
+			rc = nic_vpp_rudi_from_wire(vdata, ntohl(rudi->pkt_id),
+						&value32);
+			if (rc)
+				return rc;
+			rudi->pkt_id = htonl(value32);
+			changed = true;
+		}
+		break;
+	default:
+		break;
+	}
+
+	if (changed)
+		nic_vpp_update_crc(&view);
+	return 0;
+}
+
 static uint32_t nic_vpp_hash_mix(uint32_t hash, uint32_t value)
 {
 	hash ^= value + 0x9e3779b9U + (hash << 6) + (hash >> 2);
@@ -251,6 +613,97 @@ int nic_vpp_getinfo(struct uet_nic *nic, struct uet_nic_info *nic_info)
 	return 0;
 }
 
+static void nic_vpp_endpoint_init(uet_vpp_client_endpoint_t *endpoint,
+				  const struct uet_addr *addr,
+				  uint32_t job_id, bool absolute)
+{
+	*endpoint = (uet_vpp_client_endpoint_t) {
+		.ip_version = uet_addr_is_ipv6(addr) ? 6 : 4,
+		.absolute = absolute,
+		.pid_on_fep = addr->pid_on_fep,
+		.resource_index = addr->start_index,
+		.job_id = job_id,
+	};
+
+	if (endpoint->ip_version == 6)
+		memcpy(endpoint->ip_address, addr->fa.v6,
+		       sizeof(endpoint->ip_address));
+	else {
+		uint32_t address = htonl(addr->fa.v4);
+
+		memcpy(endpoint->ip_address, &address, sizeof(address));
+	}
+}
+
+int uet_fi_backend_configure_info(uet_handle_t handle, struct fi_info *info)
+{
+	struct uet_instance *uet = handle;
+	struct vpp_data *vdata;
+	struct uet_addr *addr;
+	uint32_t client_namespace;
+
+	if (!uet || !info || !info->src_addr ||
+	    info->src_addrlen != sizeof(*addr))
+		return -FI_EINVAL;
+	vdata = uet->nic.nic_priv_data;
+	if (!vdata || !vdata->client)
+		return -FI_EOPBADSTATE;
+	client_namespace = vdata->info.client_namespace;
+	if (!client_namespace ||
+	    client_namespace > UET_VPP_CLIENT_NAMESPACE_MAX)
+		return -FI_EIO;
+
+	addr = info->src_addr;
+	addr->pid_on_fep = (uint16_t)client_namespace;
+	addr->initiator_id =
+		(client_namespace << UET_VPP_INITIATOR_LOCAL_BITS) |
+		(UET_ADDR_DEF_INITIATOR_ID & UET_VPP_INITIATOR_LOCAL_MASK);
+	addr->flags |= UET_ADDR_PID_ON_FEP_V | UET_ADDR_INITIATOR_V;
+	return FI_SUCCESS;
+}
+
+int uet_fi_backend_endpoint_register(uet_ep_handle_t ep_handle, void **context)
+{
+	struct uet_ep *ep = ep_handle;
+	struct vpp_endpoint_registration *registration;
+	struct vpp_data *vdata;
+	int rc;
+
+	if (!ep || !context)
+		return -FI_EINVAL;
+	vdata = ep->uet_domain->uet->nic.nic_priv_data;
+	if (!vdata || !vdata->client)
+		return -FI_EOPBADSTATE;
+	registration = calloc(1, sizeof(*registration));
+	if (!registration)
+		return -FI_ENOMEM;
+	registration->vdata = vdata;
+	nic_vpp_endpoint_init(&registration->endpoint, &ep->uet_addr,
+			      ep->job_id, ep->absolute);
+	rc = uet_vpp_client_endpoint_add(vdata->client,
+					 &registration->endpoint);
+	if (rc) {
+		free(registration);
+		return rc == -EADDRINUSE ? -FI_EADDRINUSE : -FI_EIO;
+	}
+	*context = registration;
+	return FI_SUCCESS;
+}
+
+void uet_fi_backend_endpoint_unregister(void *context)
+{
+	struct vpp_endpoint_registration *registration = context;
+	int rc;
+
+	if (!registration)
+		return;
+	rc = uet_vpp_client_endpoint_del(registration->vdata->client,
+					 &registration->endpoint);
+	if (rc)
+		UET_API_ERR("failed to unregister VPP endpoint: %d", rc);
+	free(registration);
+}
+
 int nic_vpp_get_nh(struct uet_nic *nic, const struct uet_fa *fa,
 		   bool is_ipv6, uint8_t *mac)
 {
@@ -316,6 +769,13 @@ int nic_vpp_tx_pkt(struct uet_nic *nic, void *pkt, void *iphdr,
 	}
 
 	memcpy(dma_data, ip, ip_length);
+	rc = nic_vpp_translate_ids(nic, dma_data, ip_length, true);
+	if (rc) {
+		uet_vpp_client_release_dma(channel->client,
+					   channel->channel_index,
+					   request.dma_slot);
+		goto out_unlock;
+	}
 	request.packet_length = ip_length;
 	request.request_id = ++channel->next_request_id;
 	request.user_context = 0;
@@ -443,6 +903,15 @@ int nic_vpp_rx_pkt(struct uet_nic *nic, void *pkt, size_t pkt_buf_size,
 		       channel->pending_rx.iov[i].length);
 		offset += channel->pending_rx.iov[i].length;
 	}
+	rc = nic_vpp_translate_ids(nic, (uint8_t *)pkt + sizeof(*eth),
+				   channel->pending_rx.packet_length, false);
+	if (rc) {
+		int release_rc = nic_vpp_release_pending_rx(vdata);
+
+		if (release_rc)
+			rc = release_rc;
+		goto out_unlock_channel;
+	}
 
 	rc = nic_vpp_release_pending_rx(vdata);
 	if (!rc) {
@@ -480,7 +949,7 @@ static int nic_vpp_discard_rx(struct vpp_channel *channel)
 void nic_vpp_finalize(struct uet_nic *nic)
 {
 	struct vpp_data *vdata = nic->nic_priv_data;
-	uint64_t deadline = 0, now;
+	uint64_t deadline = 0, now = 0;
 	int drain_error = 0;
 	int close_error = 0;
 	bool timed = true;
@@ -644,6 +1113,7 @@ int nic_vpp_initialize(struct uet_nic *nic)
 	vdata = calloc(1, sizeof(*vdata));
 	if (!vdata)
 		return -ENOMEM;
+	atomic_init(&vdata->rudi_last_sequence_plus_one, 0);
 	vdata->pending_channel = SIZE_MAX;
 	rc = uet_vpp_client_open(&vdata->client, segment_name,
 				 &vdata->info);
@@ -658,6 +1128,11 @@ int nic_vpp_initialize(struct uet_nic *nic)
 		goto err_cleanup;
 	}
 	vdata->channel_count = vdata->info.channel_count;
+	if (!vdata->info.client_namespace ||
+	    vdata->info.client_namespace > UET_VPP_CLIENT_NAMESPACE_MAX) {
+		rc = -EPROTO;
+		goto err_cleanup;
+	}
 	rc = uet_vpp_client_map_dma(vdata->client, dma_socket);
 	if (rc)
 		goto err_cleanup;
@@ -675,7 +1150,6 @@ int nic_vpp_initialize(struct uet_nic *nic)
 	if (rc)
 		goto err_cleanup;
 	vdata->rx_lock_initialized = true;
-
 	for (size_t i = 0; i < vdata->channel_count; i++) {
 		struct vpp_channel *channel = &vdata->channels[i];
 

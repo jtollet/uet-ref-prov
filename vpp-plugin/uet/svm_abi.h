@@ -8,7 +8,7 @@
 
 #define UET_VPP_SVM_ABI_MAGIC 0x53544555U
 #define UET_VPP_SVM_ABI_MAJOR 4
-#define UET_VPP_SVM_ABI_MINOR 0
+#define UET_VPP_SVM_ABI_MINOR 1
 
 #define UET_VPP_SVM_DEFAULT_QUEUE_DEPTH 256
 #define UET_VPP_SVM_MIN_QUEUE_DEPTH	8
@@ -22,10 +22,18 @@
 #define UET_VPP_SVM_CAP_TX_GRAPH_COMPLETION  (1U << 3)
 #define UET_VPP_SVM_CAP_EXCLUSIVE_OWNER	     (1U << 4)
 #define UET_VPP_SVM_CAP_MULTI_WORKER_SEGMENT (1U << 5)
+#define UET_VPP_SVM_CAP_ENDPOINT_DEMUX	     (1U << 6)
 #define UET_VPP_SVM_REQUIRED_CAPABILITIES                                                          \
   (UET_VPP_SVM_CAP_DMA_SLOTS | UET_VPP_SVM_CAP_TX_SPSC | UET_VPP_SVM_CAP_RX_SPSC |                 \
    UET_VPP_SVM_CAP_TX_GRAPH_COMPLETION | UET_VPP_SVM_CAP_EXCLUSIVE_OWNER |                         \
-   UET_VPP_SVM_CAP_MULTI_WORKER_SEGMENT)
+   UET_VPP_SVM_CAP_MULTI_WORKER_SEGMENT | UET_VPP_SVM_CAP_ENDPOINT_DEMUX)
+
+#define UET_VPP_SVM_CLIENT_NAMESPACE_BITS 10
+#define UET_VPP_SVM_CLIENT_NAMESPACE_MAX  ((1U << UET_VPP_SVM_CLIENT_NAMESPACE_BITS) - 1)
+#define UET_VPP_SVM_PDC_LOCAL_BITS	  6
+#define UET_VPP_SVM_PDC_LOCAL_MASK	  ((1U << UET_VPP_SVM_PDC_LOCAL_BITS) - 1)
+#define UET_VPP_SVM_RUDI_LOCAL_BITS	  (32 - UET_VPP_SVM_CLIENT_NAMESPACE_BITS)
+#define UET_VPP_SVM_RUDI_LOCAL_MASK	  ((1U << UET_VPP_SVM_RUDI_LOCAL_BITS) - 1)
 
 #define UET_VPP_SVM_CLIENT_F_DMA_READY	   (1U << 0)
 #define UET_VPP_SVM_SERVER_F_DMA_READY_ACK (1U << 0)
@@ -75,7 +83,11 @@ typedef struct
   /* PID holding the lifetime lock on this application's SHM object. */
   uint32_t owner_pid;
   uint32_t server_dma_ready_count;
-  uint64_t reserved2[4];
+  uint32_t client_namespace;
+  uint32_t control_ring_size;
+  uint64_t control_request_ring_offset;
+  uint64_t control_completion_ring_offset;
+  uint64_t reserved2;
 } uet_vpp_svm_shared_header_t;
 
 /*
@@ -175,6 +187,42 @@ typedef struct
   uint32_t reserved;
 } uet_vpp_svm_rx_release_t;
 
+typedef enum
+{
+  UET_VPP_SVM_CONTROL_ENDPOINT_ADD = 1,
+  UET_VPP_SVM_CONTROL_ENDPOINT_DEL = 2,
+} uet_vpp_svm_control_op_t;
+
+typedef struct
+{
+  uint8_t ip_version;
+  uint8_t absolute;
+  uint16_t pid_on_fep;
+  uint16_t resource_index;
+  uint16_t reserved0;
+  uint32_t job_id;
+  uint8_t ip_address[16];
+  uint32_t reserved1;
+} uet_vpp_svm_endpoint_key_t;
+
+typedef struct
+{
+  uint64_t request_id;
+  uint16_t operation;
+  uint16_t reserved0;
+  uint32_t reserved1;
+  uet_vpp_svm_endpoint_key_t endpoint;
+  uint64_t reserved2[2];
+} uet_vpp_svm_control_request_t;
+
+typedef struct
+{
+  uint64_t request_id;
+  int32_t status;
+  uint32_t reserved0;
+  uint64_t reserved1[2];
+} uet_vpp_svm_control_completion_t;
+
 #ifdef __cplusplus
 #define UET_VPP_SVM_STATIC_ASSERT static_assert
 #else
@@ -218,6 +266,14 @@ UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_rx_desc_t) == 160,
 			   "unexpected UET SVM RX descriptor size");
 UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_rx_release_t) == 16,
 			   "unexpected UET SVM RX release size");
+UET_VPP_SVM_STATIC_ASSERT (offsetof (uet_vpp_svm_shared_header_t, client_namespace) == 96,
+			   "unexpected UET SVM client namespace offset");
+UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_endpoint_key_t) == 32,
+			   "unexpected UET SVM endpoint key size");
+UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_control_request_t) == 64,
+			   "unexpected UET SVM control request size");
+UET_VPP_SVM_STATIC_ASSERT (sizeof (uet_vpp_svm_control_completion_t) == 32,
+			   "unexpected UET SVM control completion size");
 
 #undef UET_VPP_SVM_STATIC_ASSERT
 

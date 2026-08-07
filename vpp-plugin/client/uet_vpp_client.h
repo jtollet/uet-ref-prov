@@ -13,6 +13,13 @@ extern "C"
 
   typedef struct uet_vpp_client uet_vpp_client_t;
 
+#define UET_VPP_CLIENT_NAMESPACE_BITS 10
+#define UET_VPP_CLIENT_NAMESPACE_MAX  ((1U << UET_VPP_CLIENT_NAMESPACE_BITS) - 1)
+#define UET_VPP_CLIENT_PDC_LOCAL_BITS  6
+#define UET_VPP_CLIENT_PDC_LOCAL_MASK  ((1U << UET_VPP_CLIENT_PDC_LOCAL_BITS) - 1)
+#define UET_VPP_CLIENT_RUDI_LOCAL_BITS (32 - UET_VPP_CLIENT_NAMESPACE_BITS)
+#define UET_VPP_CLIENT_RUDI_LOCAL_MASK ((1U << UET_VPP_CLIENT_RUDI_LOCAL_BITS) - 1)
+
   typedef enum
   {
     UET_VPP_CLIENT_STATUS_OK = 0,
@@ -27,6 +34,7 @@ extern "C"
     uint16_t abi_major;
     uint16_t abi_minor;
     uint32_t channel_count;
+    uint32_t client_namespace;
     uint32_t queue_depth;
     /* Slot and ring depths below are per channel. */
     uint32_t dma_slot_count;
@@ -71,6 +79,16 @@ extern "C"
     uint64_t user_context;
   } uet_vpp_client_tx_request_t;
 
+  typedef struct
+  {
+    uint8_t ip_version;
+    uint8_t absolute;
+    uint16_t pid_on_fep;
+    uint16_t resource_index;
+    uint32_t job_id;
+    uint8_t ip_address[16];
+  } uet_vpp_client_endpoint_t;
+
   /*
    * A successful TX completion means that VPP owns the submitted buffer and
    * dma_slot now refers to its replacement. It is not a physical device TX
@@ -90,6 +108,8 @@ extern "C"
    * SPSC channel per VPP worker.  Lifecycle calls must not overlap datapath
    * calls.  A channel has one progress owner and must not be called
    * concurrently; different channel indices may be used concurrently.
+   * Endpoint add/delete operations are serialized internally on their
+   * low-rate control ring and may run concurrently with datapath operations.
    *
    * Functions return 0 on success or a negative errno value, except poll(),
    * which returns 1 when a completion was consumed, 0 when the CQ is empty, or
@@ -99,6 +119,10 @@ extern "C"
 			   uet_vpp_client_info_t *info);
   int uet_vpp_client_close (uet_vpp_client_t *client);
   int uet_vpp_client_map_dma (uet_vpp_client_t *client, const char *socket_path);
+  int uet_vpp_client_endpoint_add (uet_vpp_client_t *client,
+				   const uet_vpp_client_endpoint_t *endpoint);
+  int uet_vpp_client_endpoint_del (uet_vpp_client_t *client,
+				   const uet_vpp_client_endpoint_t *endpoint);
 
   int uet_vpp_client_acquire_dma (uet_vpp_client_t *client, uint32_t channel_index,
 				  uint32_t *dma_slot, void **data, size_t *capacity);

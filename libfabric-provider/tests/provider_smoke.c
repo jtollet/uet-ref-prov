@@ -18,6 +18,8 @@
 #define UET_PROVIDER_SMOKE_EXTRA_MRS 31
 #define UET_PROVIDER_SMOKE_REQUESTED_MRS 8192
 #define UET_PROVIDER_SMOKE_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#define UET_PROVIDER_SMOKE_INITIATOR_LOCAL_BITS 22
+
 static int check(int rc, const char *operation)
 {
 	if (!rc)
@@ -263,6 +265,17 @@ int main(int argc, char **argv)
 	rc = fi_getname(&ep->fid, &local_addr, &addrlen);
 	if (check(rc, "fi_getname"))
 		goto out;
+	if (getenv("UET_EXPECT_NAMESPACED_ADDRESS") &&
+	    (!local_addr.pid_on_fep ||
+	     (local_addr.initiator_id >>
+	      UET_PROVIDER_SMOKE_INITIATOR_LOCAL_BITS) !=
+		     local_addr.pid_on_fep)) {
+		fprintf(stderr,
+			"backend namespace was not applied: PID %u, initiator %u\n",
+			local_addr.pid_on_fep, local_addr.initiator_id);
+		rc = -FI_EINVAL;
+		goto out;
+	}
 
 	/* A single process may create several endpoints on the same fabric
 	 * address and PIDonFEP.  They must receive distinct Resource Indices.

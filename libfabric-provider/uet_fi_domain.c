@@ -158,6 +158,12 @@ int uet_fi_domain_open(struct fid_fabric *fabric_fid, struct fi_info *info,
 				    &domain->engine_info);
 	if (rc)
 		goto err_mutex;
+	if (fabric->engine.configure_info) {
+		rc = fabric->engine.configure_info(fabric->uet,
+					   domain->engine_info);
+		if (rc)
+			goto err_info;
+	}
 	uet_fi_merge_engine_info(domain->engine_info, info);
 
 	rc = fabric->engine.domain(fabric->uet, fabric_fid,

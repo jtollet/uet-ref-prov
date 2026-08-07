@@ -13,4 +13,7 @@ target_link_libraries(uet_vpp_owner_probe PRIVATE
   ${UET_TOOLS_VPPINFRA_LIBRARY}
 )
 
+add_executable(uet_vpp_endpoint_smoke endpoint_smoke.c)
+target_link_libraries(uet_vpp_endpoint_smoke PRIVATE uet_vpp_client)
+
 add_executable(uet_dma_auth_probe dma_auth_probe.c)

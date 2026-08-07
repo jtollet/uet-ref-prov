@@ -72,6 +72,7 @@ uet_counters_clear (void)
   um->dma_authorized_clients = 0;
   um->dma_rejected_clients = 0;
   vlib_worker_thread_barrier_sync (um->vlib_main);
+  um->endpoint_collisions = 0;
   for (u32 worker = 0; worker < vlib_num_workers (); worker++)
     {
       u32 thread_index = vlib_get_worker_thread_index (worker);
@@ -192,6 +193,7 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
   uet_main_t *um = &uet_main;
   uet_client_t *client = 0;
   uword tx_ring_size, tx_completion_ring_size, rx_ring_size, rx_release_ring_size;
+  uword control_request_ring_size, control_completion_ring_size;
   vlib_buffer_pool_t *buffer_pool;
   vlib_physmem_map_t *physmem_map;
   u32 worker_count = vlib_num_workers ();
@@ -209,6 +211,8 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
     return VNET_API_ERROR_INVALID_VALUE;
   if (uet_client_find (um, segment_name))
     return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
+  if (um->next_client_namespace == UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
+    return VNET_API_ERROR_LIMIT_EXCEEDED;
 
   tx_ring_size =
     sizeof (uet_vpp_svm_spsc_ring_t) + (uword) queue_depth * sizeof (uet_vpp_svm_tx_desc_t);
@@ -218,6 +222,10 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
     sizeof (uet_vpp_svm_spsc_ring_t) + (uword) queue_depth * sizeof (uet_vpp_svm_rx_desc_t);
   rx_release_ring_size =
     sizeof (uet_vpp_svm_spsc_ring_t) + (uword) queue_depth * sizeof (uet_vpp_svm_rx_release_t);
+  control_request_ring_size =
+    sizeof (uet_vpp_svm_spsc_ring_t) + (uword) queue_depth * sizeof (uet_vpp_svm_control_request_t);
+  control_completion_ring_size = sizeof (uet_vpp_svm_spsc_ring_t) +
+				 (uword) queue_depth * sizeof (uet_vpp_svm_control_completion_t);
 
   if ((error = uet_dma_listener_init ()))
     {
@@ -252,6 +260,7 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
   client->channel_count = worker_count;
   client->queue_depth = queue_depth;
   client->generation = um->svm_generation;
+  client->client_namespace = ++um->next_client_namespace;
 
   client->segment.name = format (0, "%s%c", segment_name, 0);
   client->segment.ssvm_size = (uword) UET_SVM_SEGMENT_BASE_SIZE * worker_count;
@@ -268,12 +277,24 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
   if (client->header)
     client->shared_channels = clib_mem_alloc_aligned (
       worker_count * sizeof (*client->shared_channels), UET_VPP_SVM_SHARED_ALIGNMENT);
+  if (client->shared_channels)
+    client->control_request_ring =
+      clib_mem_alloc_aligned (control_request_ring_size, UET_VPP_SVM_SHARED_ALIGNMENT);
+  if (client->control_request_ring)
+    client->control_completion_ring =
+      clib_mem_alloc_aligned (control_completion_ring_size, UET_VPP_SVM_SHARED_ALIGNMENT);
   ssvm_pop_heap (oldheap);
-  if (!client->header || !client->shared_channels)
+  if (!client->header || !client->shared_channels || !client->control_request_ring ||
+      !client->control_completion_ring)
     goto create_failed;
 
   clib_memset (client->header, 0, sizeof (*client->header));
   clib_memset (client->shared_channels, 0, worker_count * sizeof (*client->shared_channels));
+  clib_memset (client->control_request_ring, 0, control_request_ring_size);
+  clib_memset (client->control_completion_ring, 0, control_completion_ring_size);
+  client->control_requests = (uet_vpp_svm_control_request_t *) (client->control_request_ring + 1);
+  client->control_completions =
+    (uet_vpp_svm_control_completion_t *) (client->control_completion_ring + 1);
   client->header->magic = UET_VPP_SVM_ABI_MAGIC;
   client->header->abi_major = UET_VPP_SVM_ABI_MAJOR;
   client->header->abi_minor = UET_VPP_SVM_ABI_MINOR;
@@ -293,6 +314,16 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
   client->header->tx_completion_size = sizeof (uet_vpp_svm_tx_completion_t);
   client->header->rx_desc_size = sizeof (uet_vpp_svm_rx_desc_t);
   client->header->rx_release_size = sizeof (uet_vpp_svm_rx_release_t);
+  client->header->client_namespace = client->client_namespace;
+  client->header->control_ring_size = queue_depth;
+  client->header->control_request_ring_offset =
+    (u8 *) client->control_request_ring - (u8 *) client->segment.sh;
+  client->header->control_completion_ring_offset =
+    (u8 *) client->control_completion_ring - (u8 *) client->segment.sh;
+  client->control_request_ring->size = queue_depth;
+  client->control_request_ring->mask = (queue_depth & (queue_depth - 1)) ? 0 : queue_depth - 1;
+  client->control_completion_ring->size = queue_depth;
+  client->control_completion_ring->mask = client->control_request_ring->mask;
 
   /* Reserve the stable pool index in every worker vector while workers are
    * stopped. The entries remain inactive until all shared state is ready.
@@ -398,6 +429,11 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
       channel->rx_descs = (uet_vpp_svm_rx_desc_t *) (shared_rx_ring + 1);
       channel->rx_release_ring = shared_rx_release_ring;
       channel->rx_release_entries = (uet_vpp_svm_rx_release_t *) (shared_rx_release_ring + 1);
+      channel->control_request_ring = client->control_request_ring;
+      channel->control_requests = client->control_requests;
+      channel->control_completion_ring = client->control_completion_ring;
+      channel->control_completions = client->control_completions;
+      channel->client_namespace = client->client_namespace;
 
       vec_validate (channel->rx_buffer_indices, queue_depth - 1);
       vec_validate (channel->rx_ids, queue_depth - 1);
@@ -425,6 +461,7 @@ uet_svm_create (const char *segment_name, u32 queue_depth)
       uw->thread_index = thread_index;
       channel->active = 1;
     }
+  um->client_by_namespace[client->client_namespace] = client_index;
   vlib_worker_thread_barrier_release (um->vlib_main);
 
   clib_atomic_store_rel_n (&client->segment.sh->ready, 1);
@@ -460,6 +497,8 @@ create_failed:
     ssvm_delete (&client->segment);
   else
     vec_free (client->segment.name);
+  ASSERT (client->client_namespace == um->next_client_namespace);
+  um->next_client_namespace--;
   pool_put (um->clients, client);
   uet_dma_mapping_reset_if_unused (um);
   uet_log_warn ("failed to create worker channels for generation %llu", um->svm_generation);
@@ -555,6 +594,42 @@ uet_protocols_unregister (vlib_main_t *vm)
 		 UET_UDP_PORT);
 }
 
+typedef struct
+{
+  uet_main_t *um;
+  u32 client_namespace;
+} uet_endpoint_cleanup_ctx_t;
+
+static int
+uet_endpoint_client_cleanup_cb (clib_bihash_kv_40_8_t *kv, void *arg)
+{
+  uet_endpoint_cleanup_ctx_t *ctx = arg;
+
+  if (kv->value == ctx->client_namespace)
+    {
+      clib_bihash_kv_40_8_t copy = *kv;
+
+      if (!clib_bihash_add_del_40_8 (&ctx->um->endpoint_hash, &copy, 0))
+	{
+	  ASSERT (ctx->um->endpoint_registrations > 0);
+	  ctx->um->endpoint_registrations--;
+	}
+    }
+  return BIHASH_WALK_CONTINUE;
+}
+
+static void
+uet_endpoint_client_cleanup (uet_client_t *client)
+{
+  uet_endpoint_cleanup_ctx_t ctx = {
+    .um = &uet_main,
+    .client_namespace = client->client_namespace,
+  };
+
+  clib_bihash_foreach_key_value_pair_40_8 (&ctx.um->endpoint_hash, uet_endpoint_client_cleanup_cb,
+					   &ctx);
+}
+
 int
 uet_svm_delete (const char *segment_name)
 {
@@ -592,6 +667,8 @@ uet_svm_delete (const char *segment_name)
       uet_worker_channel_outstanding_rx_free (uw, channel);
       uet_worker_channel_runtime_vectors_free (channel);
     }
+  uet_endpoint_client_cleanup (client);
+  um->client_by_namespace[client->client_namespace] = UET_INVALID_CLIENT_INDEX;
   vlib_worker_thread_barrier_release (um->vlib_main);
 
   for (u32 worker = 0; worker < client->channel_count; worker++)
@@ -888,6 +965,7 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   u64 rx_udp4_packets = 0, rx_udp4_bytes = 0, rx_udp6_packets = 0, rx_udp6_bytes = 0;
   u64 rx_delivered = 0, rx_ambiguous = 0, rx_ring_full = 0, rx_bad_chain = 0, rx_releases = 0;
   u64 rx_invalid_releases = 0, rx_outstanding = 0;
+  u64 endpoint_registrations = 0, endpoint_collisions = 0;
   u32 tx_ip4_table_id = ~0, tx_ip6_table_id = ~0;
   u32 rx_pending = 0, rx_release_pending = 0;
   u32 svm_attached = 0;
@@ -978,6 +1056,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 	      rx_release_pending += clib_atomic_load_acq_n (&channel->rx_release_ring->producer) -
 				    clib_atomic_load_acq_n (&channel->rx_release_ring->consumer);
 	    }
+	  endpoint_registrations = um->endpoint_registrations;
+	  endpoint_collisions = um->endpoint_collisions;
 	}
       vlib_worker_thread_barrier_release (vm);
     }
@@ -1021,6 +1101,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
   vlib_cli_output (vm, "rx-releases %llu", rx_releases);
   vlib_cli_output (vm, "rx-invalid-releases %llu", rx_invalid_releases);
   vlib_cli_output (vm, "rx-outstanding %llu", rx_outstanding);
+  vlib_cli_output (vm, "endpoint-registrations %llu", endpoint_registrations);
+  vlib_cli_output (vm, "endpoint-collisions %llu", endpoint_collisions);
   vlib_cli_output (vm, "dma-authorized-clients %llu", um->dma_authorized_clients);
   vlib_cli_output (vm, "dma-rejected-clients %llu", um->dma_rejected_clients);
   vlib_cli_output (vm, "local-dispatch %s ip-protocol %u udp-port %u",
@@ -1065,6 +1147,8 @@ show_uet_command_fn (vlib_main_t *vm, unformat_input_t *input, vlib_cli_command_
 
 	vlib_cli_output (vm, "application-%u-segment %s", client->index, client->segment.name);
 	vlib_cli_output (vm, "application-%u-generation %llu", client->index, client->generation);
+	vlib_cli_output (vm, "application-%u-namespace %u", client->index,
+			 client->client_namespace);
 	vlib_cli_output (vm, "application-%u-channels %u", client->index, client->channel_count);
 	vlib_cli_output (vm, "application-%u-queue-depth %u", client->index, client->queue_depth);
 	vlib_cli_output (vm, "application-%u-provider-ready %s", client->index,
@@ -1352,6 +1436,8 @@ uet_init (vlib_main_t *vm)
   um->tx_ip6_fib_index = ~0;
   um->tx_ip4_table_id = ~0;
   um->tx_ip6_table_id = ~0;
+  clib_memset (um->client_by_namespace, 0xff, sizeof (um->client_by_namespace));
+  clib_bihash_init_40_8 (&um->endpoint_hash, "uet endpoint registrations", 1024, 1 << 20);
   um->fib_source = fib_source_allocate ("uet", FIB_SOURCE_PRIORITY_HI, FIB_SOURCE_BH_SIMPLE);
   vec_validate_aligned (um->workers, n_threads - 1, CLIB_CACHE_LINE_BYTES);
 
@@ -1399,6 +1485,7 @@ uet_exit (vlib_main_t *vm)
     }
   uet_protocols_unregister (vm);
   uet_dma_listener_delete ();
+  clib_bihash_free_40_8 (&uet_main.endpoint_hash);
   if (uet_main.tx_configured)
     {
       fib_table_unlock (uet_main.tx_ip4_fib_index, FIB_PROTOCOL_IP4, uet_main.fib_source);

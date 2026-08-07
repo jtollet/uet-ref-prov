@@ -105,6 +105,7 @@ env \
   UET_VPP_SEGMENT="$segment_name" \
   UET_VPP_DMA_SOCKET="$runtime_dir/uet-dma.sock" \
   UET_VPP_IPV4_ADDR=198.18.0.1 \
+  UET_EXPECT_NAMESPACED_ADDRESS=1 \
   timeout 30s "$provider_smoke" 198.18.0.1
 
 status=$("$vpp_prefix/bin/vppctl" -s "$runtime_dir/cli.sock" show uet | tr -d '\r')

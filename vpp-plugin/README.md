@@ -106,11 +106,39 @@ Delete and recreate the SVM segment before attaching a replacement provider
 after such a crash.
 VPP refuses to delete a segment whose owner process is still alive.
 
-Until endpoint registrations are added to the shared control ABI, RX is
-delivered only when exactly one provider process is ready. If several provider
-processes are ready, VPP drops the packet as ambiguous and increments
-`rx-ambiguous`; it never guesses a destination segment. This is an intentional
-safe intermediate state for the multi-process implementation.
+Each provider registers its endpoints through the segment's low-rate control
+rings. The RX lookup key is the local IP version/address, absolute versus
+relative addressing mode, JobID for relative addressing, PIDonFEP, and Resource
+Index. VPP rejects a key already owned by another process. The provider removes
+the key when the endpoint closes; deleting a segment also removes every key
+owned by that segment, including after a crashed provider.
+
+This is connected through optional, backend-neutral engine callbacks in the
+external provider. The VPP engine supplies the process namespace and endpoint
+identity; raw-socket and AF_XDP engines need no callback and are unchanged.
+The only corresponding transport-core change is also backend-neutral: address
+resolution now preserves fields that an address-management layer has already
+marked valid instead of overwriting them with software defaults.
+
+For an initial RUD/ROD SYN, RUDI request, or UUD request, VPP reads the standard
+SES destination fields and performs the endpoint lookup. Established PDC
+traffic carries the process namespace in the high ten PDCID bits; RUDI
+responses carry it in the high ten `pkt_id` bits. These are opaque wire
+identifiers, so VPP does not keep per-packet or per-flow steering state. With
+only one ready process, the original fast path is retained: no UET parsing is
+performed and the RX ring producer is published once per VPP frame.
+
+PDC and RUDI identifier translation is confined to the VPP NIC shim, after the
+traditional transport has serialized TX and before it parses RX. The shim
+refreshes CRC32C after changing a cleartext identifier. The UET PDS and RUDI
+implementations contain no VPP-specific namespace logic.
+
+When several processes are ready, a malformed packet, a packet type without a
+supported destination identifier, or a security-encapsulated packet that hides
+those identifiers is dropped as ambiguous and increments `rx-ambiguous`; VPP
+never guesses a destination segment. Extending demux to encrypted multi-process
+traffic requires a visible steering identifier or moving security/transport
+termination into VPP.
 
 VPP Session Layer and VCL are intentionally absent. The external application
 communicates through SSVM metadata plus shared VPP physmem. The main thread is
@@ -118,14 +146,15 @@ sufficient for serialized control only because configuration callbacks run on
 that thread and use worker barriers; it is not used to serialize datapath
 access.
 
-## Shared ABI 4.0
+## Shared ABI 4.1
 
 The ABI is defined in [`uet/svm_abi.h`](uet/svm_abi.h). Structures use fixed
 width fields and offsets from a mapping base; process pointers never cross the
 boundary. A major version mismatch is rejected. New trailing fields require a
 minor version bump.
 
-ABI 4.0 contains only the production SPSC dataplane:
+ABI 4.1 contains the production SPSC dataplane plus a low-rate endpoint control
+channel:
 
 - lockless TX and TX-completion rings;
 - a lockless RX descriptor ring and RX-release ring;
@@ -133,12 +162,22 @@ ABI 4.0 contains only the production SPSC dataplane:
 - a provider-ready handshake counted across all workers, which makes DMA
   unmapping safe;
 - an exclusive owner PID, backed by a lifetime SHM lock rather than a datapath
-  mutex.
+  mutex;
+- one request/completion SPSC pair per application segment for endpoint add and
+  delete operations; and
+- a nonzero 10-bit process namespace assigned by VPP.
+
+The client library serializes endpoint control operations with one mutex. This
+does not affect TX, RX, completion, or release rings. VPP worker 0 consumes the
+control requests and updates a shared bihash; all workers perform lockless RX
+lookups. Namespaces are not reused during a VPP lifetime, preventing delayed
+packets from being redirected to a newly created process. Consequently, the
+current ABI permits 1023 segment creations before VPP must be restarted.
 
 The experimental `svm_msg_q` request path, payload verifier and fixed SSVM
 payload pool present in ABI 2.x have been removed. SSVM remains responsible
-for creating and mapping the channel set; it no longer carries packet data or a
-second request/completion protocol.
+for creating and mapping the channel set; packet data stays in shared VPP
+physmem, while SSVM carries only descriptors and the endpoint control channel.
 
 The TX pool starts with one VLIB buffer per shared slot. The client
 acquires a slot, writes the IP packet directly into its mapped VLIB data area,
@@ -192,7 +231,7 @@ The zero-copy boundaries are therefore:
 
 The client still uses VPP's SSVM attach API and must be built against a
 compatible VPP SDK. The packet-channel layout itself is defined by
-`uet/svm_abi.h` and checked as ABI 4.0 when a client opens a channel set. The
+`uet/svm_abi.h` and checked as ABI 4.1 when a client opens a channel set. The
 plugin also declares the required `VPP_BUILD_VER`, so VPP rejects an
 incompatible binary at load time.
 
@@ -218,17 +257,22 @@ plugins {
 
 uet enable
 uet rx placement entropy-handoff
-uet svm create name uet queue-size 4096
+uet svm create name uet
 ```
 
 Create a different segment name for each provider process. When several
 segments exist, deletion names the target explicitly:
 
 ```text
-uet svm create name uet-app-a queue-size 4096
-uet svm create name uet-app-b queue-size 4096
+uet svm create name uet-app-a
+uet svm create name uet-app-b
 uet svm delete name uet-app-a
 ```
+
+The default queue depth is 256. Each application segment reserves
+`worker-count * queue-depth` VPP buffers for its TX DMA slots, in addition to
+the buffers needed by the normal VPP graph. Size `buffers-per-numa` for the
+sum of all application segments before selecting a larger queue depth.
 
 This uses IPv4 and IPv6 table 0. Add `uet tx fib ...` before or after `uet
 enable` only to select other tables. The RX placement command is optional;
@@ -247,7 +291,8 @@ show trace
 clear uet counters
 ```
 
-`show uet` gives aggregate, per-application, and per-worker channel state.
+`show uet` gives aggregate, per-application, and per-worker channel state,
+including application namespaces and endpoint registration/collision counts.
 Standard node errors
 count malformed external TX requests, completion-ring saturation, invalid RX
 releases, absent or ambiguous clients, RX-ring saturation, malformed VLIB
@@ -295,8 +340,11 @@ vpp-plugin/tests/smoke-svm.sh /opt/vpp build/vpp-plugin 2 3
 `smoke-multiworker.sh` has been validated with 1, 2, 4, and 8 workers. It opens
 two concurrent provider processes, each with its own multi-worker segment, and
 verifies independent request and completion progress plus routed TX buffer
-replacement on every worker. It also verifies that RX is reported and dropped
-as ambiguous while both processes are ready and no endpoint demux is installed.
+replacement on every worker. It also verifies safe ambiguous-packet rejection,
+cross-process endpoint-collision detection, cleanup after an owner crash, and
+exact delivery to the respective SVM segment for RUD SYN and established
+traffic, ACK, PDC and RUDI NACK, CTRL, RUDI request/response, and UUD request
+packets.
 
 `smoke-svm.sh` also connects an unattached process to the DMA socket and
 verifies that it receives `-EACCES` and no file descriptor before exercising

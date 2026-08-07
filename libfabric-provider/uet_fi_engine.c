@@ -27,6 +27,8 @@ static const char *uet_fi_engine_library(void)
 
 	if (!strcmp(backend, "xdp") || !strcmp(backend, "af_xdp"))
 		return "libxdpuet.so";
+	if (!strcmp(backend, "vpp"))
+		return "libvppuet.so";
 
 	return NULL;
 }
@@ -50,6 +52,18 @@ static int uet_fi_engine_load_symbol(struct uet_fi_engine *engine,
 #define UET_FI_LOAD_SYM(engine, field, symbol) \
 	uet_fi_engine_load_symbol((engine), (void **)&(engine)->field, symbol)
 
+static void uet_fi_engine_load_optional_symbol(struct uet_fi_engine *engine,
+					       void **target, const char *name)
+{
+	dlerror();
+	*target = dlsym(engine->dl_handle, name);
+	(void)dlerror();
+}
+
+#define UET_FI_LOAD_OPTIONAL_SYM(engine, field, symbol) \
+	uet_fi_engine_load_optional_symbol((engine), \
+					   (void **)&(engine)->field, symbol)
+
 int uet_fi_engine_load(struct uet_fi_engine *engine)
 {
 	const char *library;
@@ -71,8 +85,11 @@ int uet_fi_engine_load(struct uet_fi_engine *engine)
 
 	if (UET_FI_LOAD_SYM(engine, initialize, "uet_initialize") ||
 	    UET_FI_LOAD_SYM(engine, finalize, "uet_finalize") ||
-	    UET_FI_LOAD_SYM(engine, getinfo, "uet_getinfo") ||
-	    UET_FI_LOAD_SYM(engine, domain, "uet_domain") ||
+	    UET_FI_LOAD_SYM(engine, getinfo, "uet_getinfo"))
+		goto missing_symbol;
+	UET_FI_LOAD_OPTIONAL_SYM(engine, configure_info,
+				"uet_fi_backend_configure_info");
+	if (UET_FI_LOAD_SYM(engine, domain, "uet_domain") ||
 	    UET_FI_LOAD_SYM(engine, domain_close, "uet_domain_close") ||
 	    UET_FI_LOAD_SYM(engine, endpoint, "uet_endpoint") ||
 	    UET_FI_LOAD_SYM(engine, getname, "uet_getname") ||
@@ -81,8 +98,15 @@ int uet_fi_engine_load(struct uet_fi_engine *engine)
 	    UET_FI_LOAD_SYM(engine, ep_enable, "uet_ep_enable") ||
 	    UET_FI_LOAD_SYM(engine, ep_control, "uet_ep_control") ||
 	    UET_FI_LOAD_SYM(engine, ep_setopt, "uet_ep_setopt") ||
-	    UET_FI_LOAD_SYM(engine, ep_close, "uet_ep_close") ||
-	    UET_FI_LOAD_SYM(engine, cancel, "uet_cancel") ||
+	    UET_FI_LOAD_SYM(engine, ep_close, "uet_ep_close"))
+		goto missing_symbol;
+	UET_FI_LOAD_OPTIONAL_SYM(engine, endpoint_register,
+				"uet_fi_backend_endpoint_register");
+	UET_FI_LOAD_OPTIONAL_SYM(engine, endpoint_unregister,
+				"uet_fi_backend_endpoint_unregister");
+	if (!!engine->endpoint_register != !!engine->endpoint_unregister)
+		goto invalid_extension;
+	if (UET_FI_LOAD_SYM(engine, cancel, "uet_cancel") ||
 	    UET_FI_LOAD_SYM(engine, cq_read, "uet_cq_read") ||
 	    UET_FI_LOAD_SYM(engine, cq_read_src_id, "uet_cq_read_src_id") ||
 	    UET_FI_LOAD_SYM(engine, cq_readerr, "uet_cq_readerr") ||
@@ -106,6 +130,12 @@ int uet_fi_engine_load(struct uet_fi_engine *engine)
 		goto missing_symbol;
 
 	return FI_SUCCESS;
+
+invalid_extension:
+	fprintf(stderr, "uet provider: %s has an incomplete backend extension\n",
+		library);
+	uet_fi_engine_unload(engine);
+	return -FI_ENOSYS;
 
 missing_symbol:
 	uet_fi_engine_unload(engine);

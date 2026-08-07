@@ -9,6 +9,7 @@
 #include <vnet/ip/ip.h>
 #include <vnet/vnet.h>
 #include <vppinfra/socket.h>
+#include <vppinfra/bihash_40_8.h>
 
 #include <uet/dma_abi.h>
 #include <uet/svm_abi.h>
@@ -17,6 +18,7 @@
 #define UET_INVALID_THREAD_INDEX ((u32) ~0)
 #define UET_IP_PROTOCOL		 253
 #define UET_UDP_PORT		 49150
+#define UET_INVALID_CLIENT_INDEX ((u32) ~0)
 
 typedef enum
 {
@@ -34,6 +36,7 @@ typedef struct
   u8 active;
   u8 dma_ready_ack;
   u32 client_index;
+  u32 client_namespace;
   uet_vpp_svm_shared_header_t *svm_header;
 
   u32 *dma_buffer_indices;
@@ -55,6 +58,10 @@ typedef struct
   uet_vpp_svm_rx_desc_t *rx_descs;
   uet_vpp_svm_spsc_ring_t *rx_release_ring;
   uet_vpp_svm_rx_release_t *rx_release_entries;
+  uet_vpp_svm_spsc_ring_t *control_request_ring;
+  uet_vpp_svm_control_request_t *control_requests;
+  uet_vpp_svm_spsc_ring_t *control_completion_ring;
+  uet_vpp_svm_control_completion_t *control_completions;
 } uet_worker_channel_t;
 
 /*
@@ -107,9 +114,14 @@ typedef struct
   ssvm_private_t segment;
   uet_vpp_svm_shared_header_t *header;
   uet_vpp_svm_worker_channel_t *shared_channels;
+  uet_vpp_svm_spsc_ring_t *control_request_ring;
+  uet_vpp_svm_control_request_t *control_requests;
+  uet_vpp_svm_spsc_ring_t *control_completion_ring;
+  uet_vpp_svm_control_completion_t *control_completions;
   u32 channel_count;
   u32 queue_depth;
   u64 generation;
+  u32 client_namespace;
 } uet_client_t;
 
 /* Main-thread-owned control state. */
@@ -132,6 +144,11 @@ typedef struct
   /* Main-thread-owned pool; pool indices also index worker channel vectors. */
   uet_client_t *clients;
   u64 svm_generation;
+  u32 next_client_namespace;
+  u32 client_by_namespace[UET_VPP_SVM_CLIENT_NAMESPACE_MAX + 1];
+  clib_bihash_40_8_t endpoint_hash;
+  u64 endpoint_registrations;
+  u64 endpoint_collisions;
 
   u8 dma_buffer_pool_index;
   u32 dma_buffer_data_size;

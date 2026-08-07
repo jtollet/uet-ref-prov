@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
+#include <errno.h>
+
 #include <uet/uet.h>
 
 #include <vnet/udp/udp_packet.h>
@@ -28,7 +30,7 @@ typedef enum
 
 #define foreach_uet_local_error                                                                    \
   _ (NO_CLIENT, "UET packet dropped: no ready external client")                                    \
-  _ (AMBIGUOUS_CLIENT, "UET packet dropped: multiple clients without endpoint demux")              \
+  _ (AMBIGUOUS_CLIENT, "UET packet dropped: destination ambiguous across clients")                 \
   _ (RING_FULL, "UET packet dropped: external RX ring full")                                       \
   _ (BAD_CHAIN, "UET packet dropped: invalid VLIB buffer chain")                                   \
   _ (HANDOFF_QUEUE_FULL, "UET packet dropped: worker handoff queue full")
@@ -208,6 +210,109 @@ static_always_inline u32
 uet_spsc_index (const uet_vpp_svm_spsc_ring_t *ring, u32 counter)
 {
   return ring->mask ? counter & ring->mask : counter % ring->size;
+}
+
+static_always_inline void
+uet_endpoint_bihash_key_init (const uet_vpp_svm_endpoint_key_t *endpoint, clib_bihash_kv_40_8_t *kv)
+{
+  clib_memset (kv, 0, sizeof (*kv));
+  clib_memcpy_fast (kv->key, endpoint, sizeof (*endpoint));
+}
+
+static_always_inline int
+uet_endpoint_update (uet_main_t *um, u32 client_namespace,
+		     const uet_vpp_svm_control_request_t *request)
+{
+  const uet_vpp_svm_endpoint_key_t *endpoint = &request->endpoint;
+  clib_bihash_kv_40_8_t kv, result;
+  u32 client_index;
+  int found;
+
+  if (!client_namespace || client_namespace > UET_VPP_SVM_CLIENT_NAMESPACE_MAX ||
+      !request->request_id || request->reserved0 || request->reserved1 || request->reserved2[0] ||
+      request->reserved2[1] || (endpoint->ip_version != 4 && endpoint->ip_version != 6) ||
+      endpoint->absolute > 1 || endpoint->pid_on_fep > 0x0fff ||
+      endpoint->resource_index > 0x0fff || endpoint->job_id > 0x00ffffff || endpoint->reserved0 ||
+      endpoint->reserved1 || (endpoint->absolute && endpoint->job_id))
+    return -EINVAL;
+  if (endpoint->ip_version == 4)
+    for (u32 i = 4; i < sizeof (endpoint->ip_address); i++)
+      if (endpoint->ip_address[i])
+	return -EINVAL;
+
+  client_index = um->client_by_namespace[client_namespace];
+  if (client_index == UET_INVALID_CLIENT_INDEX || pool_is_free_index (um->clients, client_index))
+    return -ENOENT;
+
+  uet_endpoint_bihash_key_init (endpoint, &kv);
+  found = clib_bihash_search_40_8 (&um->endpoint_hash, &kv, &result) == 0;
+  if (request->operation == UET_VPP_SVM_CONTROL_ENDPOINT_ADD)
+    {
+      if (found)
+	{
+	  if (result.value == client_namespace)
+	    return 0;
+	  um->endpoint_collisions++;
+	  return -EADDRINUSE;
+	}
+      kv.value = client_namespace;
+      if (clib_bihash_add_del_40_8 (&um->endpoint_hash, &kv, 1))
+	return -ENOMEM;
+      um->endpoint_registrations++;
+      return 0;
+    }
+  if (request->operation == UET_VPP_SVM_CONTROL_ENDPOINT_DEL)
+    {
+      if (!found)
+	return -ENOENT;
+      if (result.value != client_namespace)
+	return -EPERM;
+      kv.value = result.value;
+      if (clib_bihash_add_del_40_8 (&um->endpoint_hash, &kv, 0))
+	return -EIO;
+      ASSERT (um->endpoint_registrations > 0);
+      um->endpoint_registrations--;
+      return 0;
+    }
+  return -EINVAL;
+}
+
+static_always_inline void
+uet_control_process (uet_main_t *um, uet_worker_channel_t *channel)
+{
+  uet_vpp_svm_spsc_ring_t *request_ring = channel->control_request_ring;
+  uet_vpp_svm_spsc_ring_t *completion_ring = channel->control_completion_ring;
+  u32 request_consumer = clib_atomic_load_relax_n (&request_ring->consumer);
+  u32 request_producer = clib_atomic_load_acq_n (&request_ring->producer);
+  u32 completion_producer = clib_atomic_load_relax_n (&completion_ring->producer);
+  u32 completion_consumer = clib_atomic_load_acq_n (&completion_ring->consumer);
+  u32 available = request_producer - request_consumer;
+  u32 processed = 0;
+
+  if (PREDICT_FALSE (available > request_ring->size ||
+		     completion_producer - completion_consumer > completion_ring->size))
+    return;
+  available = clib_min (available, (u32) UET_SPSC_MAX_BATCH);
+  while (processed < available && completion_producer - completion_consumer < completion_ring->size)
+    {
+      const uet_vpp_svm_control_request_t *request =
+	channel->control_requests + uet_spsc_index (request_ring, request_consumer + processed);
+      uet_vpp_svm_control_completion_t completion = {
+	.request_id = request->request_id,
+	.status = uet_endpoint_update (um, channel->client_namespace, request),
+      };
+      u32 completion_index = uet_spsc_index (completion_ring, completion_producer);
+
+      clib_memcpy_fast (channel->control_completions + completion_index, &completion,
+			sizeof (completion));
+      completion_producer++;
+      processed++;
+    }
+  if (processed)
+    {
+      clib_atomic_store_rel_n (&completion_ring->producer, completion_producer);
+      clib_atomic_store_rel_n (&request_ring->consumer, request_consumer + processed);
+    }
 }
 
 static_always_inline void
@@ -575,6 +680,8 @@ uet_svm_process (vlib_main_t *vm, vlib_node_runtime_t *node, uet_worker_t *uw,
   if (!(client_flags & UET_VPP_SVM_CLIENT_F_DMA_READY))
     return 0;
 
+  if (uw->thread_index == vlib_get_worker_thread_index (0))
+    uet_control_process (&uet_main, channel);
   uet_rx_release_process (vm, uw, channel);
   uet_tx_process (vm, uw, channel, tx_buffers, tx_nexts, tx_trace_ids, &n_tx);
 
@@ -621,30 +728,289 @@ typedef enum
   UET_LOCAL_N_NEXT,
 } uet_local_next_t;
 
+#define UET_WIRE_PDS_TYPE_MASK	  0xf800
+#define UET_WIRE_PDS_TYPE_SHIFT	  11
+#define UET_WIRE_PDS_NEXT_MASK	  0x0780
+#define UET_WIRE_PDS_NEXT_SHIFT	  7
+#define UET_WIRE_PDS_FLAGS_MASK	  0x007f
+#define UET_WIRE_PDS_RUD_REQ	  2
+#define UET_WIRE_PDS_ROD_REQ	  3
+#define UET_WIRE_PDS_RUDI_REQ	  4
+#define UET_WIRE_PDS_RUDI_RESP	  5
+#define UET_WIRE_PDS_UUD_REQ	  6
+#define UET_WIRE_PDS_ACK	  7
+#define UET_WIRE_PDS_ACK_CC	  8
+#define UET_WIRE_PDS_ACK_CCX	  9
+#define UET_WIRE_PDS_NACK	  10
+#define UET_WIRE_PDS_CTRL	  11
+#define UET_WIRE_PDS_NACK_CCX	  12
+#define UET_WIRE_PDS_RUD_CC_REQ	  13
+#define UET_WIRE_PDS_ROD_CC_REQ	  14
+#define UET_WIRE_PDS_REQ_SYN	  0x04
+#define UET_WIRE_PDS_NACK_RUDI	  0x08
+#define UET_WIRE_SES_REQ_STD	  3
+#define UET_WIRE_SES_RELATIVE	  0x08
+#define UET_WIRE_PDC_HEADER_SIZE  12
+#define UET_WIRE_NACK_HEADER_SIZE 16
+#define UET_WIRE_CTRL_HEADER_SIZE 16
+#define UET_WIRE_RUDI_HEADER_SIZE 8
+#define UET_WIRE_UUD_HEADER_SIZE  4
+#define UET_WIRE_SES_REQ_CMN_SIZE 12
+
+static_always_inline int
+uet_rx_endpoint_namespace (uet_main_t *um, const u8 *ses, u32 available, const void *dst_address,
+			   u8 is_ip4, u32 *client_namespace)
+{
+  uet_vpp_svm_endpoint_key_t endpoint = {
+    .ip_version = is_ip4 ? 4 : 6,
+  };
+  clib_bihash_kv_40_8_t kv, result;
+  u16 value16;
+  u32 value32;
+
+  if (available < UET_WIRE_SES_REQ_CMN_SIZE)
+    return 0;
+  endpoint.absolute = !(ses[1] & UET_WIRE_SES_RELATIVE);
+  clib_memcpy_fast (&value32, ses + 4, sizeof (value32));
+  endpoint.job_id = endpoint.absolute ? 0 : clib_net_to_host_u32 (value32) & 0x00ffffff;
+  clib_memcpy_fast (&value16, ses + 8, sizeof (value16));
+  endpoint.pid_on_fep = clib_net_to_host_u16 (value16) & 0x0fff;
+  clib_memcpy_fast (&value16, ses + 10, sizeof (value16));
+  endpoint.resource_index = clib_net_to_host_u16 (value16) & 0x0fff;
+  clib_memcpy_fast (endpoint.ip_address, dst_address, is_ip4 ? 4 : 16);
+  uet_endpoint_bihash_key_init (&endpoint, &kv);
+  if (clib_bihash_search_40_8 (&um->endpoint_hash, &kv, &result))
+    return 0;
+  if (!result.value || result.value > UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
+    return 0;
+  *client_namespace = result.value;
+  return 1;
+}
+
+static_always_inline int
+uet_rx_packet_namespace (vlib_buffer_t *buffer, u8 is_ip4, u8 is_udp, u32 *client_namespace)
+{
+  uet_main_t *um = &uet_main;
+  u8 *start = buffer->data + vnet_buffer (buffer)->l3_hdr_offset;
+  u8 *end = vlib_buffer_get_current (buffer) + buffer->current_length;
+  const void *dst_address;
+  u8 *pds;
+  u32 available, l4_offset;
+  u16 prologue, pdc_id;
+  u8 type, next_header, flags;
+
+  if (start < buffer->data - VLIB_BUFFER_PRE_DATA_SIZE || start >= end)
+    return 0;
+  available = end - start;
+  if (is_ip4)
+    {
+      ip4_header_t *ip4 = (ip4_header_t *) start;
+
+      if (available < sizeof (*ip4))
+	return 0;
+      l4_offset = ip4_header_bytes (ip4);
+      if (l4_offset < sizeof (*ip4) || l4_offset > available)
+	return 0;
+      dst_address = &ip4->dst_address;
+    }
+  else
+    {
+      ip6_header_t *ip6 = (ip6_header_t *) start;
+
+      if (available < sizeof (*ip6))
+	return 0;
+      l4_offset = sizeof (*ip6);
+      dst_address = &ip6->dst_address;
+    }
+  l4_offset += is_udp ? sizeof (udp_header_t) : 4;
+  if (l4_offset + sizeof (prologue) > available)
+    return 0;
+  pds = start + l4_offset;
+  available -= l4_offset;
+  clib_memcpy_fast (&prologue, pds, sizeof (prologue));
+  prologue = clib_net_to_host_u16 (prologue);
+  type = (prologue & UET_WIRE_PDS_TYPE_MASK) >> UET_WIRE_PDS_TYPE_SHIFT;
+  next_header = (prologue & UET_WIRE_PDS_NEXT_MASK) >> UET_WIRE_PDS_NEXT_SHIFT;
+  flags = prologue & UET_WIRE_PDS_FLAGS_MASK;
+
+  switch (type)
+    {
+    case UET_WIRE_PDS_RUD_REQ:
+    case UET_WIRE_PDS_ROD_REQ:
+    case UET_WIRE_PDS_RUD_CC_REQ:
+    case UET_WIRE_PDS_ROD_CC_REQ:
+      if (available < UET_WIRE_PDC_HEADER_SIZE)
+	return 0;
+      if (!(flags & UET_WIRE_PDS_REQ_SYN))
+	{
+	  clib_memcpy_fast (&pdc_id, pds + 10, sizeof (pdc_id));
+	  *client_namespace = clib_net_to_host_u16 (pdc_id) >> UET_VPP_SVM_PDC_LOCAL_BITS;
+	  return *client_namespace != 0;
+	}
+      if (next_header != UET_WIRE_SES_REQ_STD)
+	return 0;
+      l4_offset = UET_WIRE_PDC_HEADER_SIZE +
+		  ((type == UET_WIRE_PDS_RUD_CC_REQ || type == UET_WIRE_PDS_ROD_CC_REQ) ? 4 : 0);
+      if (l4_offset > available)
+	return 0;
+      return uet_rx_endpoint_namespace (um, pds + l4_offset, available - l4_offset, dst_address,
+					is_ip4, client_namespace);
+    case UET_WIRE_PDS_ACK:
+    case UET_WIRE_PDS_ACK_CC:
+    case UET_WIRE_PDS_ACK_CCX:
+      if (available < UET_WIRE_PDC_HEADER_SIZE)
+	return 0;
+      clib_memcpy_fast (&pdc_id, pds + 10, sizeof (pdc_id));
+      *client_namespace = clib_net_to_host_u16 (pdc_id) >> UET_VPP_SVM_PDC_LOCAL_BITS;
+      return *client_namespace != 0;
+    case UET_WIRE_PDS_NACK:
+    case UET_WIRE_PDS_NACK_CCX:
+      if (available < UET_WIRE_NACK_HEADER_SIZE)
+	return 0;
+      if (flags & UET_WIRE_PDS_NACK_RUDI)
+	{
+	  u32 packet_id;
+
+	  clib_memcpy_fast (&packet_id, pds + 4, sizeof (packet_id));
+	  *client_namespace = clib_net_to_host_u32 (packet_id) >> UET_VPP_SVM_RUDI_LOCAL_BITS;
+	}
+      else
+	{
+	  clib_memcpy_fast (&pdc_id, pds + 10, sizeof (pdc_id));
+	  *client_namespace = clib_net_to_host_u16 (pdc_id) >> UET_VPP_SVM_PDC_LOCAL_BITS;
+	}
+      return *client_namespace != 0;
+    case UET_WIRE_PDS_CTRL:
+      if (available < UET_WIRE_CTRL_HEADER_SIZE || (flags & UET_WIRE_PDS_REQ_SYN))
+	return 0;
+      clib_memcpy_fast (&pdc_id, pds + 10, sizeof (pdc_id));
+      *client_namespace = clib_net_to_host_u16 (pdc_id) >> UET_VPP_SVM_PDC_LOCAL_BITS;
+      return *client_namespace != 0;
+    case UET_WIRE_PDS_RUDI_REQ:
+      if (available < UET_WIRE_RUDI_HEADER_SIZE || next_header != UET_WIRE_SES_REQ_STD)
+	return 0;
+      return uet_rx_endpoint_namespace (um, pds + UET_WIRE_RUDI_HEADER_SIZE,
+					available - UET_WIRE_RUDI_HEADER_SIZE, dst_address, is_ip4,
+					client_namespace);
+    case UET_WIRE_PDS_RUDI_RESP:
+      if (available < UET_WIRE_RUDI_HEADER_SIZE)
+	return 0;
+      {
+	u32 packet_id;
+
+	clib_memcpy_fast (&packet_id, pds + 4, sizeof (packet_id));
+	*client_namespace = clib_net_to_host_u32 (packet_id) >> UET_VPP_SVM_RUDI_LOCAL_BITS;
+	return *client_namespace != 0;
+      }
+    case UET_WIRE_PDS_UUD_REQ:
+      if (available < UET_WIRE_UUD_HEADER_SIZE || next_header != UET_WIRE_SES_REQ_STD)
+	return 0;
+      return uet_rx_endpoint_namespace (um, pds + UET_WIRE_UUD_HEADER_SIZE,
+					available - UET_WIRE_UUD_HEADER_SIZE, dst_address, is_ip4,
+					client_namespace);
+    default:
+      return 0;
+    }
+}
+
 static_always_inline uet_worker_channel_t *
-uet_rx_channel_select (uet_worker_t *uw, u8 *ambiguous)
+uet_rx_channels_prepare (vlib_main_t *vm, uet_worker_t *uw, u32 *ready_count)
 {
   uet_worker_channel_t *selected = 0;
 
-  *ambiguous = 0;
+  *ready_count = 0;
   for (u32 client_index = 0; client_index < vec_len (uw->channels); client_index++)
     {
       uet_worker_channel_t *channel = uw->channels + client_index;
 
       if (!channel->active)
 	continue;
-      uet_rx_release_process (vlib_get_main_by_index (uw->thread_index), uw, channel);
+      uet_rx_release_process (vm, uw, channel);
       if (!(clib_atomic_load_acq_n (&channel->svm_header->client_flags) &
 	    UET_VPP_SVM_CLIENT_F_DMA_READY))
 	continue;
-      if (selected)
-	{
-	  *ambiguous = 1;
-	  return 0;
-	}
       selected = channel;
+      (*ready_count)++;
     }
   return selected;
+}
+
+static_always_inline uet_worker_channel_t *
+uet_rx_channel_select (uet_worker_t *uw, vlib_buffer_t *buffer, u8 is_ip4, u8 is_udp,
+		       u32 ready_count, uet_worker_channel_t *single_channel, u8 *ambiguous)
+{
+  uet_worker_channel_t *selected;
+  u32 client_namespace, client_index;
+
+  *ambiguous = 0;
+  if (ready_count <= 1)
+    return single_channel;
+
+  *ambiguous = 1;
+  if (!uet_rx_packet_namespace (buffer, is_ip4, is_udp, &client_namespace) ||
+      client_namespace > UET_VPP_SVM_CLIENT_NAMESPACE_MAX)
+    return 0;
+  client_index = uet_main.client_by_namespace[client_namespace];
+  if (client_index == UET_INVALID_CLIENT_INDEX || client_index >= vec_len (uw->channels))
+    return 0;
+  selected = uw->channels + client_index;
+  if (!selected->active || !(clib_atomic_load_acq_n (&selected->svm_header->client_flags) &
+			     UET_VPP_SVM_CLIENT_F_DMA_READY))
+    return 0;
+  *ambiguous = 0;
+  return selected;
+}
+
+static_always_inline int
+uet_rx_publish (vlib_main_t *vm, vlib_node_runtime_t *node, uet_main_t *um, uet_worker_t *uw,
+		uet_worker_channel_t *channel, u32 buffer_index, vlib_buffer_t *buffer,
+		u32 *producer, u32 consumer, u8 is_ip4, u8 is_udp, uet_trace_state_t *trace_state)
+{
+  uet_vpp_svm_spsc_ring_t *ring = channel->rx_ring;
+  uet_vpp_svm_rx_desc_t descriptor;
+  u32 token;
+  u64 rx_id;
+
+  if (PREDICT_FALSE (*producer - consumer >= ring->size || !channel->rx_free_count))
+    {
+      uw->rx_ring_full++;
+      buffer->error = node->errors[UET_LOCAL_ERROR_RING_FULL];
+      uet_trace_add (vm, node, buffer, trace_state, UET_LOCAL_NEXT_DROP, 0,
+		     uet_rx_ip_packet_length (vm, buffer, is_ip4),
+		     vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */, is_ip4 ? 4 : 6, is_udp,
+		     UET_TRACE_RX_RING_FULL, 0);
+      return 0;
+    }
+
+  token = channel->rx_free_slots[channel->rx_free_count - 1];
+  if (PREDICT_FALSE (!uet_rx_descriptor_build (vm, um, buffer, token, is_ip4, is_udp, &descriptor)))
+    {
+      uw->rx_bad_chain++;
+      buffer->error = node->errors[UET_LOCAL_ERROR_BAD_CHAIN];
+      uet_trace_add (vm, node, buffer, trace_state, UET_LOCAL_NEXT_DROP, 0,
+		     uet_rx_ip_packet_length (vm, buffer, is_ip4),
+		     vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */, is_ip4 ? 4 : 6, is_udp,
+		     UET_TRACE_RX_BAD_CHAIN, 0);
+      return 0;
+    }
+
+  rx_id = channel->next_rx_id++;
+  if (PREDICT_FALSE (!rx_id))
+    rx_id = channel->next_rx_id++;
+  descriptor.rx_id = rx_id;
+  clib_memcpy_fast (channel->rx_descs + uet_spsc_index (ring, *producer), &descriptor,
+		    sizeof (descriptor));
+  channel->rx_free_count--;
+  channel->rx_ids[token] = rx_id;
+  channel->rx_buffer_indices[token] = buffer_index;
+  channel->rx_outstanding++;
+  uw->rx_outstanding++;
+  uw->rx_delivered++;
+  uet_trace_add (vm, node, buffer, trace_state, UET_LOCAL_NEXT_DROP, rx_id,
+		 descriptor.packet_length, descriptor.rx_sw_if_index, 1 /* RX */, is_ip4 ? 4 : 6,
+		 is_udp, UET_TRACE_RX_DELIVERED, descriptor.segment_count);
+  (*producer)++;
+  return 1;
 }
 
 static_always_inline uword
@@ -653,18 +1019,18 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 {
   uet_main_t *um = &uet_main;
   uet_worker_t *uw = 0;
-  uet_worker_channel_t *channel = 0;
+  uet_worker_channel_t *single_channel = 0;
   u32 drop_buffers[VLIB_FRAME_SIZE];
   u32 n_drop = 0;
+  u32 ready_count = 0;
   u64 bytes = 0;
-  u8 ambiguous = 0;
   uet_trace_state_t trace_state = { 0 };
 
   if (PREDICT_TRUE (um->enabled && vm->thread_index > 0 &&
 		    vm->thread_index < vec_len (um->workers)))
     {
       uw = vec_elt_at_index (um->workers, vm->thread_index);
-      channel = uet_rx_channel_select (uw, &ambiguous);
+      single_channel = uet_rx_channels_prepare (vm, uw, &ready_count);
       for (u32 i = 0; i < n_vectors; i++)
 	bytes += uet_rx_ip_packet_length (vm, vlib_get_buffer (vm, from[i]), is_ip4);
 
@@ -689,9 +1055,9 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 	  uw->rx_ip6_bytes += bytes;
 	}
 
-      if (PREDICT_TRUE (channel != 0))
+      if (PREDICT_TRUE (ready_count == 1))
 	{
-	  uet_vpp_svm_spsc_ring_t *ring = channel->rx_ring;
+	  uet_vpp_svm_spsc_ring_t *ring = single_channel->rx_ring;
 	  u32 producer = clib_atomic_load_relax_n (&ring->producer);
 	  u32 consumer = clib_atomic_load_acq_n (&ring->consumer);
 
@@ -699,75 +1065,49 @@ uet_local_deliver (vlib_main_t *vm, vlib_node_runtime_t *node, u32 *from, u32 n_
 	    {
 	      u32 buffer_index = from[i];
 	      vlib_buffer_t *buffer = vlib_get_buffer (vm, buffer_index);
-	      uet_vpp_svm_rx_desc_t descriptor;
-	      u32 token;
-	      u64 rx_id;
 
-	      if (PREDICT_FALSE (producer - consumer >= ring->size || !channel->rx_free_count))
-		{
-		  uw->rx_ring_full++;
-		  buffer->error = node->errors[UET_LOCAL_ERROR_RING_FULL];
-		  uet_trace_add (vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, 0,
-				 uet_rx_ip_packet_length (vm, buffer, is_ip4),
-				 vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */,
-				 is_ip4 ? 4 : 6, is_udp, UET_TRACE_RX_RING_FULL, 0);
-		  drop_buffers[n_drop++] = buffer_index;
-		  continue;
-		}
-
-	      token = channel->rx_free_slots[channel->rx_free_count - 1];
-	      if (PREDICT_FALSE (
-		    !uet_rx_descriptor_build (vm, um, buffer, token, is_ip4, is_udp, &descriptor)))
-		{
-		  uw->rx_bad_chain++;
-		  buffer->error = node->errors[UET_LOCAL_ERROR_BAD_CHAIN];
-		  uet_trace_add (vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, 0,
-				 uet_rx_ip_packet_length (vm, buffer, is_ip4),
-				 vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */,
-				 is_ip4 ? 4 : 6, is_udp, UET_TRACE_RX_BAD_CHAIN, 0);
-		  drop_buffers[n_drop++] = buffer_index;
-		  continue;
-		}
-
-	      rx_id = channel->next_rx_id++;
-	      if (PREDICT_FALSE (!rx_id))
-		rx_id = channel->next_rx_id++;
-	      descriptor.rx_id = rx_id;
-	      clib_memcpy_fast (channel->rx_descs + uet_spsc_index (ring, producer), &descriptor,
-				sizeof (descriptor));
-	      channel->rx_free_count--;
-	      channel->rx_ids[token] = rx_id;
-	      channel->rx_buffer_indices[token] = buffer_index;
-	      channel->rx_outstanding++;
-	      uw->rx_outstanding++;
-	      uw->rx_delivered++;
-	      uet_trace_add (vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, rx_id,
-			     descriptor.packet_length, descriptor.rx_sw_if_index, 1 /* RX */,
-			     is_ip4 ? 4 : 6, is_udp, UET_TRACE_RX_DELIVERED,
-			     descriptor.segment_count);
-	      producer++;
+	      if (!uet_rx_publish (vm, node, um, uw, single_channel, buffer_index, buffer,
+				   &producer, consumer, is_ip4, is_udp, &trace_state))
+		drop_buffers[n_drop++] = buffer_index;
 	    }
-
 	  clib_atomic_store_rel_n (&ring->producer, producer);
 	}
       else
-	{
-	  if (ambiguous)
-	    uw->rx_ambiguous += n_vectors;
-	  for (u32 i = 0; i < n_vectors; i++)
-	    {
-	      vlib_buffer_t *buffer = vlib_get_buffer (vm, from[i]);
+	for (u32 i = 0; i < n_vectors; i++)
+	  {
+	    u32 buffer_index = from[i];
+	    vlib_buffer_t *buffer = vlib_get_buffer (vm, buffer_index);
+	    uet_worker_channel_t *channel;
+	    u8 ambiguous;
 
-	      buffer->error = node->errors[ambiguous ? UET_LOCAL_ERROR_AMBIGUOUS_CLIENT :
-						       UET_LOCAL_ERROR_NO_CLIENT];
-	      uet_trace_add (vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, 0,
-			     uet_rx_ip_packet_length (vm, buffer, is_ip4),
-			     vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */, is_ip4 ? 4 : 6,
-			     is_udp,
-			     ambiguous ? UET_TRACE_RX_AMBIGUOUS_CLIENT : UET_TRACE_RX_NO_CLIENT, 0);
-	      drop_buffers[n_drop++] = from[i];
+	    channel = uet_rx_channel_select (uw, buffer, is_ip4, is_udp, ready_count,
+					     single_channel, &ambiguous);
+	    if (PREDICT_FALSE (!channel))
+	      {
+		if (ambiguous)
+		  uw->rx_ambiguous++;
+		buffer->error = node->errors[ambiguous ? UET_LOCAL_ERROR_AMBIGUOUS_CLIENT :
+							 UET_LOCAL_ERROR_NO_CLIENT];
+		uet_trace_add (
+		  vm, node, buffer, &trace_state, UET_LOCAL_NEXT_DROP, 0,
+		  uet_rx_ip_packet_length (vm, buffer, is_ip4),
+		  vnet_buffer (buffer)->ip.rx_sw_if_index, 1 /* RX */, is_ip4 ? 4 : 6, is_udp,
+		  ambiguous ? UET_TRACE_RX_AMBIGUOUS_CLIENT : UET_TRACE_RX_NO_CLIENT, 0);
+		drop_buffers[n_drop++] = buffer_index;
+		continue;
+	      }
+
+	    {
+	      uet_vpp_svm_spsc_ring_t *ring = channel->rx_ring;
+	      u32 producer = clib_atomic_load_relax_n (&ring->producer);
+	      u32 consumer = clib_atomic_load_acq_n (&ring->consumer);
+
+	      if (!uet_rx_publish (vm, node, um, uw, channel, buffer_index, buffer, &producer,
+				   consumer, is_ip4, is_udp, &trace_state))
+		drop_buffers[n_drop++] = buffer_index;
+	      clib_atomic_store_rel_n (&ring->producer, producer);
 	    }
-	}
+	  }
     }
   else
     {

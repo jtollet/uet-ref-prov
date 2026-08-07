@@ -39,6 +39,7 @@ struct uet_fi_engine {
 	int (*finalize)(uet_handle_t handle);
 	int (*getinfo)(uet_handle_t handle, struct uet_addr *node,
 		       const struct fi_info *hints, struct fi_info **info);
+	int (*configure_info)(uet_handle_t handle, struct fi_info *info);
 	int (*domain)(uet_handle_t handle, struct fid_fabric *fabric,
 		      struct fi_info *info, struct fid_domain *domain,
 		      void *context, uet_eq_callback_t eq_callback,
@@ -59,6 +60,8 @@ struct uet_fi_engine {
 	int (*ep_setopt)(uet_ep_handle_t ep_handle, int level, int optname,
 			 const void *optval, size_t optlen);
 	int (*ep_close)(uet_ep_handle_t ep_handle);
+	int (*endpoint_register)(uet_ep_handle_t ep_handle, void **context);
+	void (*endpoint_unregister)(void *context);
 	int (*cancel)(uet_ep_handle_t ep_handle, void *context);
 
 	ssize_t (*cq_read)(uet_cq_handle_t cq_handle, void *buf, size_t count);
@@ -186,6 +189,7 @@ struct uet_fi_ep {
 	struct uet_fi_cq *tx_cq;
 	struct uet_fi_cq *rx_cq;
 	struct uet_fi_mr *mrs;
+	void *engine_endpoint_context;
 	bool enabled;
 };
 

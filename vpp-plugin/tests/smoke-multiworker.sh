@@ -24,6 +24,7 @@ vppctl_bin="$vpp_prefix/bin/vppctl"
 plugin_dir="$plugin_build_dir/lib/vpp_plugins"
 tx_client_bin="$plugin_build_dir/bin/uet_vpp_tx_smoke"
 owner_probe_bin="$plugin_build_dir/bin/uet_vpp_owner_probe"
+endpoint_smoke_bin="$plugin_build_dir/bin/uet_vpp_endpoint_smoke"
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 runtime_dir=$(mktemp -d /tmp/uet-vpp-multiworker.XXXXXX)
 config_file="$runtime_dir/startup.conf"
@@ -37,10 +38,14 @@ tx_pid_a=
 tx_pid_b=
 hold_pid_a=
 hold_pid_b=
+endpoint_pid_a=
+endpoint_pid_b=
+collision_holder_pid=
 
 cleanup()
 {
-  for client_pid in "$hold_pid_a" "$hold_pid_b" "$tx_pid_a" "$tx_pid_b"; do
+  for client_pid in "$collision_holder_pid" "$endpoint_pid_a" "$endpoint_pid_b" \
+    "$hold_pid_a" "$hold_pid_b" "$tx_pid_a" "$tx_pid_b"; do
     if [[ -n "$client_pid" ]] && kill -0 "$client_pid" 2>/dev/null; then
       kill "$client_pid"
       wait "$client_pid" 2>/dev/null || true
@@ -54,7 +59,8 @@ cleanup()
 trap cleanup EXIT
 
 for required in "$vpp_bin" "$vppctl_bin" "$plugin_dir/uet_plugin.so" \
-  "$tx_client_bin" "$owner_probe_bin" "$plugin_build_dir/lib/libuet_vpp_client.so"; do
+  "$tx_client_bin" "$owner_probe_bin" "$endpoint_smoke_bin" \
+  "$plugin_build_dir/lib/libuet_vpp_client.so"; do
   if [[ ! -e "$required" ]]; then
     echo "missing required file: $required" >&2
     exit 1
@@ -191,6 +197,133 @@ wait "$hold_pid_a" 2>/dev/null || true
 wait "$hold_pid_b" 2>/dev/null || true
 hold_pid_a=
 hold_pid_b=
+
 "${cli[@]}" uet svm delete name "$segment_name_a"
 "${cli[@]}" uet svm delete name "$segment_name_b"
-echo "UET two-process, $worker_count-worker independent-channel smoke test passed; logs: $runtime_dir"
+"${cli[@]}" uet svm create name "$segment_name_a" queue-size 256
+"${cli[@]}" uet svm create name "$segment_name_b" queue-size 256
+
+LD_LIBRARY_PATH="$library_path" "$endpoint_smoke_bin" "$segment_name_a" \
+  "$runtime_dir/uet-dma.sock" hold 777 >"$runtime_dir/collision-holder.log" 2>&1 &
+collision_holder_pid=$!
+for _ in $(seq 1 500); do
+  grep -q '^endpoint control ready: pid 777$' "$runtime_dir/collision-holder.log" 2>/dev/null && break
+  sleep 0.01
+done
+grep -q '^endpoint control ready: pid 777$' "$runtime_dir/collision-holder.log"
+LD_LIBRARY_PATH="$library_path" "$endpoint_smoke_bin" "$segment_name_b" \
+  "$runtime_dir/uet-dma.sock" expect-collision 777
+status=$("${cli[@]}" show uet | tr -d '\r')
+grep -q '^endpoint-registrations 1$' <<<"$status"
+grep -q '^endpoint-collisions 1$' <<<"$status"
+kill -KILL "$collision_holder_pid"
+wait "$collision_holder_pid" 2>/dev/null || true
+collision_holder_pid=
+"${cli[@]}" uet svm delete name "$segment_name_a"
+"${cli[@]}" uet svm create name "$segment_name_a" queue-size 256
+LD_LIBRARY_PATH="$library_path" "$endpoint_smoke_bin" "$segment_name_b" \
+  "$runtime_dir/uet-dma.sock" control 777
+"${cli[@]}" show uet | tr -d '\r' | grep -q '^endpoint-registrations 0$'
+
+"${cli[@]}" clear uet counters
+LD_LIBRARY_PATH="$library_path" "$endpoint_smoke_bin" "$segment_name_a" \
+  "$runtime_dir/uet-dma.sock" >"$runtime_dir/endpoint-a.log" 2>&1 &
+endpoint_pid_a=$!
+LD_LIBRARY_PATH="$library_path" "$endpoint_smoke_bin" "$segment_name_b" \
+  "$runtime_dir/uet-dma.sock" >"$runtime_dir/endpoint-b.log" 2>&1 &
+endpoint_pid_b=$!
+for _ in $(seq 1 500); do
+  if grep -q '^endpoint ready: namespace ' "$runtime_dir/endpoint-a.log" 2>/dev/null &&
+    grep -q '^endpoint ready: namespace ' "$runtime_dir/endpoint-b.log" 2>/dev/null; then
+    break
+  fi
+  sleep 0.01
+done
+grep -q '^endpoint ready: namespace ' "$runtime_dir/endpoint-a.log"
+grep -q '^endpoint ready: namespace ' "$runtime_dir/endpoint-b.log"
+namespace_a=$(awk '/^endpoint ready: namespace / { print $4; exit }' "$runtime_dir/endpoint-a.log")
+namespace_b=$(awk '/^endpoint ready: namespace / { print $4; exit }' "$runtime_dir/endpoint-b.log")
+printf -v pid_a_hex '%04x' "$namespace_a"
+printf -v pid_b_hex '%04x' "$namespace_b"
+printf -v pdc_a_hex '%04x' "$(((namespace_a << 6) | 1))"
+printf -v pdc_b_hex '%04x' "$(((namespace_b << 6) | 1))"
+printf -v pkt_a_hex '%08x' "$(((namespace_a << 22) | 1))"
+printf -v pkt_b_hex '%08x' "$(((namespace_b << 22) | 1))"
+
+inject_endpoint_packet()
+{
+  local name=$1
+  local udp_source=$2
+  local packet_size=$3
+  local payload=$4
+
+  "${cli[@]}" "packet-generator new {
+    name $name
+    limit 1
+    worker 0
+    node ip4-input
+    interface loop0
+    size $packet_size-$packet_size
+    data {
+      UDP: 198.18.0.2 -> 198.18.0.1
+      UDP: $udp_source -> 49150
+      hex 0x$payload
+    }
+  }"
+  "${cli[@]}" packet-generator enable-stream "$name"
+}
+
+inject_endpoint_routes()
+{
+  local label=$1
+  local pid_hex=$2
+  local pdc_hex=$3
+  local pkt_hex=$4
+  local port_base=$5
+  local ses="0008000100000000${pid_hex}000f"
+
+  inject_endpoint_packet "uet-$label-rud-syn" "$((port_base + 0))" 52 \
+    "11840000000000a100010000${ses}"
+  inject_endpoint_packet "uet-$label-rud-established" "$((port_base + 1))" 40 \
+    "10000000000000a20001${pdc_hex}"
+  inject_endpoint_packet "uet-$label-ack" "$((port_base + 2))" 40 \
+    "38000000000000a30001${pdc_hex}"
+  inject_endpoint_packet "uet-$label-nack-pdc" "$((port_base + 3))" 44 \
+    "50000100000000a40001${pdc_hex}00000000"
+  inject_endpoint_packet "uet-$label-control" "$((port_base + 4))" 44 \
+    "58800000000000a50001${pdc_hex}00000000"
+  inject_endpoint_packet "uet-$label-rudi-request" "$((port_base + 5))" 48 \
+    "21800000000000a6${ses}"
+  inject_endpoint_packet "uet-$label-rudi-response" "$((port_base + 6))" 36 \
+    "28000000${pkt_hex}"
+  inject_endpoint_packet "uet-$label-nack-rudi" "$((port_base + 7))" 44 \
+    "50080100${pkt_hex}0000000000000000"
+  inject_endpoint_packet "uet-$label-uud-request" "$((port_base + 8))" 44 \
+    "31800000${ses}"
+}
+
+inject_endpoint_routes endpoint-a "$pid_a_hex" "$pdc_a_hex" "$pkt_a_hex" 10000
+inject_endpoint_routes endpoint-b "$pid_b_hex" "$pdc_b_hex" "$pkt_b_hex" 10016
+if ! wait "$endpoint_pid_a"; then
+  endpoint_pid_a=
+  cat "$runtime_dir/endpoint-a.log" >&2
+  exit 1
+fi
+endpoint_pid_a=
+if ! wait "$endpoint_pid_b"; then
+  endpoint_pid_b=
+  cat "$runtime_dir/endpoint-b.log" >&2
+  exit 1
+fi
+endpoint_pid_b=
+grep -q "^endpoint RX namespace $namespace_a passed$" "$runtime_dir/endpoint-a.log"
+grep -q "^endpoint RX namespace $namespace_b passed$" "$runtime_dir/endpoint-b.log"
+status=$("${cli[@]}" show uet | tr -d '\r')
+grep -q '^rx-delivered 18$' <<<"$status"
+grep -q '^rx-ambiguous 0$' <<<"$status"
+grep -q '^rx-releases 18$' <<<"$status"
+grep -q '^endpoint-registrations 0$' <<<"$status"
+
+"${cli[@]}" uet svm delete name "$segment_name_a"
+"${cli[@]}" uet svm delete name "$segment_name_b"
+echo "UET two-process, $worker_count-worker endpoint demux smoke test passed; logs: $runtime_dir"

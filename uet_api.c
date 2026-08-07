@@ -4575,13 +4575,23 @@ static int uet_pds_to_ses_pds_err(uet_pkt_handle_t tx_pkt_handle,
 #if !ENABLE_VERBS
 static int uet_addr_resolution(struct uet_addr *uet_addr, uint32_t *job_id)
 {
-	uet_addr->pid_on_fep = UET_ADDR_DEF_PID_ON_FEP;
-	uet_addr->num_indices = 1;
-	uet_addr->start_index = UET_ADDR_DEF_INDEX;
-	uet_addr->initiator_id = UET_ADDR_DEF_INITIATOR_ID;
-
-	uet_addr->flags |= (UET_ADDR_PID_ON_FEP_V | UET_ADDR_INDEX_V |
-			    UET_ADDR_INITIATOR_V);
+	/* Preserve an address supplied by an address-management layer and only
+	 * fill fields that have not been resolved yet. This is backend-neutral:
+	 * existing shims still receive the historical software defaults.
+	 */
+	if (!(uet_addr->flags & UET_ADDR_PID_ON_FEP_V)) {
+		uet_addr->pid_on_fep = UET_ADDR_DEF_PID_ON_FEP;
+		uet_addr->flags |= UET_ADDR_PID_ON_FEP_V;
+	}
+	if (!(uet_addr->flags & UET_ADDR_INDEX_V)) {
+		uet_addr->num_indices = 1;
+		uet_addr->start_index = UET_ADDR_DEF_INDEX;
+		uet_addr->flags |= UET_ADDR_INDEX_V;
+	}
+	if (!(uet_addr->flags & UET_ADDR_INITIATOR_V)) {
+		uet_addr->initiator_id = UET_ADDR_DEF_INITIATOR_ID;
+		uet_addr->flags |= UET_ADDR_INITIATOR_V;
+	}
 
 	*job_id = UET_DEF_JOB_ID;
 
