@@ -90,8 +90,8 @@ XDP_MAIN_OBJ=$(XDP_OBJ_DIR)/uet.o
 XDP_KERN_SRC=$(wildcard nic_shim/*xdp_kern*)
 XDP_KERN_BIN=uet_xdp_kern.o
 
-xdp: CFLAGS+=-DENABLE_XDP -DXDP_PROG=$(XDP_KERN_BIN)
-xdp: LDFLAGS+=-lbpf -lxdp
+xdp xdp-engine: CFLAGS+=-DENABLE_VERBS=0 -DENABLE_XDP -DXDP_PROG=$(XDP_KERN_BIN)
+xdp xdp-engine: LDFLAGS+=-lxdp -lbpf
 
 # Libfabric provider.  The provider is backend-neutral and loads one of the
 # existing UET engine libraries at fi_fabric() time according to UET_NIC_SHIM.
@@ -116,7 +116,9 @@ xdp: $(XDP_BIN) $(XDP_KERN_BIN)
 
 provider: $(FABRIC_LIB) $(PROVIDER_LIB)
 
-provider-xdp: provider xdp
+provider-xdp: provider xdp-engine
+
+xdp-engine: $(XDP_LIB) $(XDP_KERN_BIN)
 
 provider-smoke: $(PROVIDER_SMOKE)
 
@@ -219,4 +221,4 @@ clean:
 		$(PROVIDER_SMOKE) \
 		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN)
 
-.PHONY: all xdp provider provider-xdp provider-smoke cc_sim clean
+.PHONY: all xdp xdp-engine provider provider-xdp provider-smoke cc_sim clean
