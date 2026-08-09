@@ -122,6 +122,31 @@ below build libfabric v1.20.1 and use a symlink for the common name.
 
 ## Build and Run
 
+### libfabric provider
+
+Build the external `uet` provider and its default raw-socket engine with:
+
+```
+% make provider
+% make provider-smoke
+```
+
+`libuet-fi.so` is a single provider plugin for the existing NIC backends. It
+loads an engine when the fabric is opened, according to `UET_NIC_SHIM`:
+
+```
+% FI_PROVIDER_PATH=$PWD \
+  LD_LIBRARY_PATH=../libfabric/src/.libs:$PWD \
+  UET_NIC_SHIM=rawsock \
+  ../libfabric/util/fi_info -p uet
+```
+
+Use `UET_NIC_SHIM=xdp` (or `af_xdp`) with `make provider-xdp`. An application
+selects provider `uet` through the usual libfabric mechanism; no
+backend-specific provider library or application source change is required.
+See the [provider documentation](libfabric-provider/README.md) for its API
+scope, tests, and current zero-copy boundary.
+
 ### rawsock
 
 > The `uet` program only has the `rawsock` NIC shim built into it.
@@ -193,9 +218,15 @@ Replace `2` with the desired number of senders.
 
 ## Environment Variables
 
-- **LD_LIBRARY_PATH** - Needed for dynamic linking to the `libfabric` and `libuet` libraries.
+- **LD_LIBRARY_PATH** - Needed for dynamic linking to the `libfabric` and
+  `libuet` libraries.
+- **FI_PROVIDER_PATH** - Directory containing the external `libuet-fi.so`
+  provider.
 - **UET_IFNAME** - The ifname of the interface to attach to.
-- **UET_NIC_SHIM** - [ `rawsock` | `xdp` ]
+- **UET_NIC_SHIM** - [ `rawsock` | `xdp` | `af_xdp` ]. The external `uet`
+  provider accepts `af_xdp` as an alias for `xdp`.
+- **UET_ENGINE_LIBRARY** - Optional path overriding the engine selected by
+  `UET_NIC_SHIM` when `libuet-fi.so` opens a fabric.
 - **UET_PDS** - [ `sng` | `pds` ] (default=`sng` stop-n-go)
 - **UET_PDS_PER_PKT_ACK_ENB** - [ `0` | `1` ] (default=`0`)
 - **UET_PDS_ACK_TYPE** - [ `ack` | `ack_cc` | `ack_ccx` ] (default=`ack`)
@@ -392,4 +423,3 @@ Running `checkpatch.pl` out of tree against a local `.h` or `.c` file:
 ```
 
 Thank you! 😀
-
