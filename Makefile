@@ -73,7 +73,7 @@ MAIN_OBJ=$(OBJ_DIR)/uet.o
 XDP_LIBNAME=xdpuet
 XDP_LIB=lib$(XDP_LIBNAME).so
 XDP_LIB_SRC=$(filter-out uet.c, \
-	    $(filter-out nic_shim/*xdp_kern*, \
+	    $(filter-out $(wildcard nic_shim/*xdp_kern*), \
 			 $(wildcard *.c \
 				    util/*.c \
 				    imp_shim/*.c \
@@ -93,6 +93,16 @@ XDP_KERN_BIN=uet_xdp_kern.o
 xdp: CFLAGS+=-DENABLE_XDP -DXDP_PROG=$(XDP_KERN_BIN)
 xdp: LDFLAGS+=-lbpf -lxdp
 
+# Libfabric provider.  The provider is backend-neutral and loads one of the
+# existing UET engine libraries at fi_fabric() time according to UET_NIC_SHIM.
+PROVIDER_LIB=libuet-fi.so
+PROVIDER_SRC=$(wildcard libfabric-provider/*.c)
+PROVIDER_HDRS=$(wildcard libfabric-provider/*.h)
+PROVIDER_OBJ_DIR=obj_libuet_provider
+PROVIDER_OBJ=$(patsubst %.c, $(PROVIDER_OBJ_DIR)/%.o, $(PROVIDER_SRC))
+PROVIDER_SMOKE=uet_provider_smoke
+PROVIDER_SMOKE_SRC=libfabric-provider/tests/provider_smoke.c
+
 CC_SIM_BIN=uet_cc_sim
 CC_SIM_SRC=$(wildcard cc/*.c cc_sim/*.c)
 CC_SIM_OBJ_DIR=obj_cc_sim
@@ -103,6 +113,12 @@ all: $(FABRIC_LIB) $(VERBS_LIB) $(BIN)
 
 # XDP target
 xdp: $(XDP_BIN) $(XDP_KERN_BIN)
+
+provider: $(FABRIC_LIB) $(PROVIDER_LIB)
+
+provider-xdp: provider xdp
+
+provider-smoke: $(PROVIDER_SMOKE)
 
 # CC sim target
 cc_sim: $(CC_SIM_BIN)
@@ -164,9 +180,24 @@ $(XDP_BIN): $(XDP_LIB) $(XDP_MAIN_OBJ)
 
 $(XDP_KERN_BIN): $(XDP_KERN_SRC)
 	@echo 'Building XDP kernel program: $@'
-	@$(CLANG) -O2 -g -Wall -target bpf \
+	@$(CLANG) -O2 -g -Wall -target bpf -D__$(shell uname -m)__ \
 		  -I/usr/include/$(shell uname -m)-linux-gnu \
 		  -c -o $(XDP_KERN_BIN) $(XDP_KERN_SRC)
+
+$(PROVIDER_OBJ_DIR)/%.o: %.c $(HDRS) $(PROVIDER_HDRS)
+	@mkdir -p $(PROVIDER_OBJ_DIR)/$(dir $<)
+	@echo 'Building libfabric provider object: $<'
+	@$(CC) $(CFLAGS) -D_GNU_SOURCE -DENABLE_VERBS=0 $(INCS) $(LF_HDRS) \
+		-Ilibfabric-provider -fPIC -c -o $@ $<
+
+$(PROVIDER_LIB): $(PROVIDER_OBJ)
+	@echo 'Building libfabric provider: $@'
+	@$(CC) -shared $(PROVIDER_OBJ) -o $@ $(LDFLAGS) $(LF_LIBS) -ldl
+
+$(PROVIDER_SMOKE): $(PROVIDER_SMOKE_SRC)
+	@echo 'Building libfabric provider smoke test: $@'
+	@$(CC) $(CFLAGS) -D_GNU_SOURCE $(INCS) $(LF_HDRS) $< -o $@ \
+		$(LDFLAGS) $(LF_LIBS)
 
 $(CC_SIM_OBJ_DIR)/%.o: %.c $(HDRS)
 	@mkdir -p $(CC_SIM_OBJ_DIR)/$(dir $<)
@@ -184,7 +215,8 @@ clean:
 		$(XDP_LIB_OBJ_DIR) $(XDP_LIB) \
 		$(XDP_OBJ_DIR) $(XDP_BIN) \
 		$(XDP_KERN_BIN) \
+		$(PROVIDER_OBJ_DIR) $(PROVIDER_LIB) \
+		$(PROVIDER_SMOKE) \
 		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN)
 
-.PHONY: all xdp cc_sim clean
-
+.PHONY: all xdp provider provider-xdp provider-smoke cc_sim clean

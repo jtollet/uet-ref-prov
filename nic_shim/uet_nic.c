@@ -371,7 +371,8 @@ int uet_nic_initialize(struct uet_nic *nic)
 		nic->nic_finalize    = nic_rawsock_finalize;
 		nic->nic_initialize  = nic_rawsock_initialize;
 #if ENABLE_XDP
-	} else if (strcmp(nic_shim, "xdp") == 0) {
+	} else if ((strcmp(nic_shim, "xdp") == 0) ||
+		   (strcmp(nic_shim, "af_xdp") == 0)) {
 		nic->nic_getinfo     = nic_xdp_getinfo;
 		nic->nic_tx_pkt      = nic_xdp_tx_pkt;
 		nic->nic_rx_pkt      = nic_xdp_rx_pkt;
