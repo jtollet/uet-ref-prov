@@ -1,7 +1,6 @@
+// SPDX-License-Identifier: MIT
 /*
  * Copyright (c) 2026 Cisco Systems, Inc. All rights reserved.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #include <stdlib.h>
@@ -65,12 +64,14 @@ static const char *uet_fi_eq_strerror(struct fid_eq *eq, int prov_errno,
 				     size_t len)
 {
 	const char *text = fi_strerror(prov_errno);
+	size_t copy_len;
 
 	(void)eq;
 	(void)err_data;
 	if (buf && len) {
-		strncpy(buf, text, len - 1);
-		buf[len - 1] = '\0';
+		copy_len = strnlen(text, len - 1);
+		memcpy(buf, text, copy_len);
+		buf[copy_len] = '\0';
 		return buf;
 	}
 	return text;

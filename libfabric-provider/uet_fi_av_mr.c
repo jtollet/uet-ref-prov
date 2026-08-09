@@ -1,7 +1,6 @@
+// SPDX-License-Identifier: MIT
 /*
  * Copyright (c) 2026 Cisco Systems, Inc. All rights reserved.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #include <arpa/inet.h>

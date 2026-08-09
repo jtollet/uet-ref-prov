@@ -5808,6 +5808,18 @@ static int uet_fid_nic_close(struct fid *fid)
 	return 0;
 }
 
+static int uet_dup_string(char **destination, const char *source)
+{
+	if (source == NULL)
+		return FI_SUCCESS;
+
+	*destination = strdup(source);
+	if (*destination == NULL)
+		return -FI_ENOMEM;
+
+	return FI_SUCCESS;
+}
+
 static int uet_fid_nic_control(struct fid *fid, int command, void *arg)
 {
 	struct fid_nic *nic = (struct fid_nic *)fid;
@@ -5828,22 +5840,19 @@ static int uet_fid_nic_control(struct fid *fid, int command, void *arg)
 		dup->device_attr = calloc(1, sizeof(*dup->device_attr));
 		if (dup->device_attr == NULL)
 			goto err;
-#define UET_DUP_NIC_STRING(_field)                                      \
-		do {                                                        \
-			if (nic->device_attr->_field != NULL) {              \
-				dup->device_attr->_field =                      \
-					strdup(nic->device_attr->_field);        \
-				if (dup->device_attr->_field == NULL)            \
-					goto err;                                 \
-			}                                                   \
-		} while (0)
-		UET_DUP_NIC_STRING(name);
-		UET_DUP_NIC_STRING(device_id);
-		UET_DUP_NIC_STRING(device_version);
-		UET_DUP_NIC_STRING(vendor_id);
-		UET_DUP_NIC_STRING(driver);
-		UET_DUP_NIC_STRING(firmware);
-#undef UET_DUP_NIC_STRING
+		if (uet_dup_string(&dup->device_attr->name,
+				   nic->device_attr->name) != FI_SUCCESS ||
+		    uet_dup_string(&dup->device_attr->device_id,
+				   nic->device_attr->device_id) != FI_SUCCESS ||
+		    uet_dup_string(&dup->device_attr->device_version,
+				   nic->device_attr->device_version) != FI_SUCCESS ||
+		    uet_dup_string(&dup->device_attr->vendor_id,
+				   nic->device_attr->vendor_id) != FI_SUCCESS ||
+		    uet_dup_string(&dup->device_attr->driver,
+				   nic->device_attr->driver) != FI_SUCCESS ||
+		    uet_dup_string(&dup->device_attr->firmware,
+				   nic->device_attr->firmware) != FI_SUCCESS)
+			goto err;
 	}
 
 	if (nic->bus_attr != NULL) {
@@ -5860,17 +5869,11 @@ static int uet_fid_nic_control(struct fid *fid, int command, void *arg)
 		*dup->link_attr = *nic->link_attr;
 		dup->link_attr->network_type = NULL;
 		dup->link_attr->address = NULL;
-		if (nic->link_attr->network_type != NULL) {
-			dup->link_attr->network_type =
-				strdup(nic->link_attr->network_type);
-			if (dup->link_attr->network_type == NULL)
-				goto err;
-		}
-		if (nic->link_attr->address != NULL) {
-			dup->link_attr->address = strdup(nic->link_attr->address);
-			if (dup->link_attr->address == NULL)
-				goto err;
-		}
+		if (uet_dup_string(&dup->link_attr->network_type,
+				   nic->link_attr->network_type) != FI_SUCCESS ||
+		    uet_dup_string(&dup->link_attr->address,
+				   nic->link_attr->address) != FI_SUCCESS)
+			goto err;
 	}
 
 	*(struct fid_nic **)arg = dup;

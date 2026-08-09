@@ -1,7 +1,6 @@
+// SPDX-License-Identifier: MIT
 /*
  * Copyright (c) 2026 Cisco Systems, Inc. All rights reserved.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #include <sched.h>
@@ -100,12 +99,13 @@ static ssize_t uet_fi_cq_read_internal(struct uet_fi_cq *cq, void *buf,
 static ssize_t uet_fi_cq_read(struct fid_cq *cq_fid, void *buf, size_t count)
 {
 	struct uet_fi_cq *cq;
+	ssize_t rc;
 
 	if (!buf)
 		return -FI_EINVAL;
 	cq = UET_FI_CONTAINER(cq_fid, struct uet_fi_cq, cq_fid);
 	pthread_mutex_lock(&cq->lock);
-	ssize_t rc = uet_fi_cq_read_internal(cq, buf, count, NULL, NULL);
+	rc = uet_fi_cq_read_internal(cq, buf, count, NULL, NULL);
 	pthread_mutex_unlock(&cq->lock);
 	return rc;
 }
@@ -232,12 +232,14 @@ static const char *uet_fi_cq_strerror(struct fid_cq *cq, int prov_errno,
 				      size_t len)
 {
 	const char *text = fi_strerror(prov_errno);
+	size_t copy_len;
 
 	(void)cq;
 	(void)err_data;
 	if (buf && len) {
-		strncpy(buf, text, len - 1);
-		buf[len - 1] = '\0';
+		copy_len = strnlen(text, len - 1);
+		memcpy(buf, text, copy_len);
+		buf[copy_len] = '\0';
 		return buf;
 	}
 	return text;
