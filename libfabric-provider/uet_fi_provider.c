@@ -15,7 +15,7 @@
 #include "uet_fi_noop.h"
 
 #define UET_FI_CAPS (FI_MSG | FI_TAGGED | FI_SEND | FI_RECV | \
-		     FI_DIRECTED_RECV | FI_LOCAL_COMM | FI_REMOTE_COMM)
+		     FI_LOCAL_COMM | FI_REMOTE_COMM)
 
 static struct fi_provider uet_fi_provider;
 
@@ -173,7 +173,7 @@ static int uet_fi_getinfo(uint32_t version, const char *node,
 	info->tx_attr->tclass = FI_TC_BEST_EFFORT;
 
 	info->rx_attr->caps = caps & (FI_MSG | FI_TAGGED | FI_RECV |
-				      FI_DIRECTED_RECV | FI_LOCAL_COMM |
+				      FI_LOCAL_COMM |
 				      FI_REMOTE_COMM);
 	info->rx_attr->mode = info->mode;
 	info->rx_attr->msg_order = FI_ORDER_SAS;
@@ -195,10 +195,10 @@ static int uet_fi_getinfo(uint32_t version, const char *node,
 	info->domain_attr->av_type = FI_AV_TABLE;
 	info->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_PROV_KEY;
 	info->domain_attr->mr_key_size = sizeof(uint64_t);
-	info->domain_attr->cq_cnt = 2;
-	info->domain_attr->ep_cnt = 1;
-	info->domain_attr->tx_ctx_cnt = 1;
-	info->domain_attr->rx_ctx_cnt = 1;
+	info->domain_attr->cq_cnt = 2 * UET_FI_DEFAULT_EP_CNT;
+	info->domain_attr->ep_cnt = UET_FI_DEFAULT_EP_CNT;
+	info->domain_attr->tx_ctx_cnt = UET_FI_DEFAULT_EP_CNT;
+	info->domain_attr->rx_ctx_cnt = UET_FI_DEFAULT_EP_CNT;
 	info->domain_attr->max_ep_tx_ctx = 1;
 	info->domain_attr->max_ep_rx_ctx = 1;
 	info->domain_attr->mr_iov_limit = UET_FI_IOV_LIMIT;

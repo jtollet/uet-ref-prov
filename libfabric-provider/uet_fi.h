@@ -28,6 +28,7 @@
 #define UET_FI_DEFAULT_QUEUE    256
 #define UET_FI_DEFAULT_AV       64
 #define UET_FI_DEFAULT_MR_CNT   256
+#define UET_FI_DEFAULT_EP_CNT   256
 #define UET_FI_IOV_LIMIT        8
 #define UET_FI_MAX_MSG_SIZE     ((size_t)UINT32_MAX - 1)
 

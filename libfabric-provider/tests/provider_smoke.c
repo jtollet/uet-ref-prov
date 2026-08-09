@@ -158,6 +158,20 @@ int main(int argc, char **argv)
 		rc = -FI_ENODATA;
 		goto out;
 	}
+	if (info->domain_attr->ep_cnt < 3 ||
+	    info->domain_attr->tx_ctx_cnt < 3 ||
+	    info->domain_attr->rx_ctx_cnt < 3) {
+		fprintf(stderr,
+			"fi_getinfo did not advertise multi-endpoint capacity\n");
+		rc = -FI_ENODATA;
+		goto out;
+	}
+	if (info->caps & FI_DIRECTED_RECV) {
+		fprintf(stderr,
+			"fi_getinfo advertised unqualified directed receive\n");
+		rc = -FI_ENODATA;
+		goto out;
+	}
 	fprintf(stderr, "smoke: fi_fabric\n");
 	rc = fi_fabric(info->fabric_attr, &fabric, NULL);
 	if (check(rc, "fi_fabric"))
