@@ -65,6 +65,7 @@ jobs:
       - name: Compile uet-ref-prov
         run: |
           make
+          make provider provider-smoke
 
       - name: Check network brm to vm
         run: |
@@ -99,6 +100,59 @@ jobs:
           sudo ip -6 neigh add fd00:1::1 lladdr $MAC2 dev vm2 nud permanent
           sudo ip -6 neigh add fd00:1::2 lladdr $MAC1 dev brm nud permanent
 
+      - name: Validate the external libfabric provider
+        run: |
+          set -euo pipefail
+          provider_env=(
+            FI_PROVIDER_PATH="$PWD"
+            LD_LIBRARY_PATH="$PWD:../libfabric/src/.libs"
+            UET_NIC_SHIM=rawsock
+          )
+
+          env "${provider_env[@]}" ../libfabric/util/fi_info -p uet
+          if [ "${{ matrix.family }}" = ipv6 ]; then
+            smoke_addr=fd00:1::1
+          else
+            smoke_addr=10.1.0.1
+          fi
+          sudo env "${provider_env[@]}" UET_IFNAME=brm \
+            ./uet_provider_smoke "$smoke_addr"
+
+          server_pid=
+          cleanup() {
+            if [ -n "$server_pid" ]; then
+              sudo kill "$server_pid" 2>/dev/null || true
+            fi
+            sudo ip netns del uet-fi-provider-a 2>/dev/null || true
+            sudo ip netns del uet-fi-provider-b 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sudo ip netns add uet-fi-provider-a
+          sudo ip netns add uet-fi-provider-b
+          sudo ip link add uet-fi-a type veth peer name uet-fi-b
+          sudo ip link set uet-fi-a netns uet-fi-provider-a
+          sudo ip link set uet-fi-b netns uet-fi-provider-b
+          sudo ip -n uet-fi-provider-a addr add 192.0.2.1/24 dev uet-fi-a
+          sudo ip -n uet-fi-provider-b addr add 192.0.2.2/24 dev uet-fi-b
+          sudo ip -n uet-fi-provider-a link set lo up
+          sudo ip -n uet-fi-provider-b link set lo up
+          sudo ip -n uet-fi-provider-a link set uet-fi-a up
+          sudo ip -n uet-fi-provider-b link set uet-fi-b up
+
+          timeout 30 sudo ip netns exec uet-fi-provider-a \
+            env "${provider_env[@]}" UET_IFNAME=uet-fi-a \
+            ../libfabric/util/fi_pingpong -p uet -e rdm -m msg \
+            -I 100 -S 1024 -c &
+          server_pid=$!
+          sleep 2
+          timeout 30 sudo ip netns exec uet-fi-provider-b \
+            env "${provider_env[@]}" UET_IFNAME=uet-fi-b \
+            ../libfabric/util/fi_pingpong -p uet -e rdm -m msg \
+            -I 100 -S 1024 -c 192.0.2.1
+          wait "$server_pid"
+          server_pid=
+
       # Suite via scripts/uet_test.sh, which sets each mode's env (security
       # modes, SSI, ack_cc, timeouts) and auto-discovers ../libfabric. One
       # PDS-cell/test per loop iteration keeps the server (background) and
@@ -126,4 +180,3 @@ jobs:
               echo "::endgroup::"
             done
           done
-
