@@ -105,7 +105,7 @@ static void uet_fi_merge_engine_info(struct fi_info *engine_info,
 	engine_info->domain_attr->mr_key_size = sizeof(uint64_t);
 	engine_info->domain_attr->mr_iov_limit = UET_FI_IOV_LIMIT;
 	engine_info->domain_attr->mr_cnt = requested->domain_attr->mr_cnt ?
-		requested->domain_attr->mr_cnt : UET_DEF_MR_CNT;
+		requested->domain_attr->mr_cnt : UET_FI_DEFAULT_MR_CNT;
 }
 
 int uet_fi_domain_open(struct fid_fabric *fabric_fid, struct fi_info *info,

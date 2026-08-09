@@ -16,6 +16,8 @@
 
 #include "uet_addr.h"
 
+#define UET_PROVIDER_SMOKE_EXTRA_MRS 31
+#define UET_PROVIDER_SMOKE_REQUESTED_MRS 8192
 #define UET_PROVIDER_SMOKE_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 static int check(int rc, const char *operation)
 {
@@ -64,6 +66,38 @@ static int check_threading_hints(const char *node)
 	return FI_SUCCESS;
 }
 
+static int check_mr_count_hint(const char *node)
+{
+	struct fi_info *hints;
+	struct fi_info *info = NULL;
+	int rc;
+
+	hints = fi_allocinfo();
+	if (!hints)
+		return -FI_ENOMEM;
+	hints->caps = FI_MSG;
+	hints->ep_attr->type = FI_EP_RDM;
+	hints->domain_attr->mr_cnt = UET_PROVIDER_SMOKE_REQUESTED_MRS;
+	hints->fabric_attr->prov_name = strdup("uet");
+	if (!hints->fabric_attr->prov_name) {
+		rc = -FI_ENOMEM;
+		goto out;
+	}
+
+	rc = fi_getinfo(FI_VERSION(1, 20), node, NULL, FI_SOURCE,
+			hints, &info);
+	if (!rc && info->domain_attr->mr_cnt < UET_PROVIDER_SMOKE_REQUESTED_MRS) {
+		fprintf(stderr, "requested %u memory regions, provider returned %zu\n",
+			UET_PROVIDER_SMOKE_REQUESTED_MRS,
+			info->domain_attr->mr_cnt);
+		rc = -FI_ENODATA;
+	}
+out:
+	fi_freeinfo(info);
+	fi_freeinfo(hints);
+	return rc;
+}
+
 int main(int argc, char **argv)
 {
 	struct fi_info *hints = NULL, *info = NULL;
@@ -74,6 +108,7 @@ int main(int argc, char **argv)
 	struct fid_cq *cq = NULL;
 	struct fid_ep *ep = NULL, *ep2 = NULL, *ep3 = NULL;
 	struct fid_mr *mr = NULL;
+	struct fid_mr *extra_mrs[UET_PROVIDER_SMOKE_EXTRA_MRS] = { 0 };
 	struct fi_av_attr av_attr = { .type = FI_AV_TABLE, .count = 16 };
 	struct fi_eq_attr eq_attr = { .wait_obj = FI_WAIT_NONE };
 	struct fi_cq_attr cq_attr = {
@@ -84,6 +119,8 @@ int main(int argc, char **argv)
 	struct uet_addr local_addr, local_addr2, local_addr3;
 	size_t addrlen = sizeof(local_addr);
 	char buffer[4096];
+	char extra_buffers[UET_PROVIDER_SMOKE_EXTRA_MRS][64];
+	size_t i;
 	int close_rc;
 	int rc = 1;
 
@@ -95,6 +132,10 @@ int main(int argc, char **argv)
 	fprintf(stderr, "smoke: threading hints\n");
 	rc = check_threading_hints(argv[1]);
 	if (check(rc, "fi_getinfo(threading hints)"))
+		return 1;
+	fprintf(stderr, "smoke: MR count hint\n");
+	rc = check_mr_count_hint(argv[1]);
+	if (check(rc, "fi_getinfo(MR count hint)"))
 		return 1;
 
 	hints = fi_allocinfo();
@@ -111,6 +152,12 @@ int main(int argc, char **argv)
 			hints, &info);
 	if (check(rc, "fi_getinfo"))
 		goto out;
+	if (info->domain_attr->mr_cnt < UET_PROVIDER_SMOKE_EXTRA_MRS + 1) {
+		fprintf(stderr, "fi_getinfo returned only %zu memory regions\n",
+			info->domain_attr->mr_cnt);
+		rc = -FI_ENODATA;
+		goto out;
+	}
 	fprintf(stderr, "smoke: fi_fabric\n");
 	rc = fi_fabric(info->fabric_attr, &fabric, NULL);
 	if (check(rc, "fi_fabric"))
@@ -180,6 +227,21 @@ int main(int argc, char **argv)
 	rc = fi_mr_enable(mr);
 	if (check(rc, "fi_mr_enable"))
 		goto out;
+	/* The provider's default domain must support more than the engine's
+	 * historical 16-MR minimum without application-specific fi_info edits.
+	 */
+	for (i = 0; i < UET_PROVIDER_SMOKE_EXTRA_MRS; i++) {
+		rc = fi_mr_reg(domain, extra_buffers[i], sizeof(extra_buffers[i]),
+			       FI_SEND | FI_RECV, 0, 0, 0, &extra_mrs[i], NULL);
+		if (check(rc, "fi_mr_reg(extra)"))
+			goto out;
+		rc = fi_mr_bind(extra_mrs[i], &ep->fid, 0);
+		if (check(rc, "fi_mr_bind(extra)"))
+			goto out;
+		rc = fi_mr_enable(extra_mrs[i]);
+		if (check(rc, "fi_mr_enable(extra)"))
+			goto out;
+	}
 	fprintf(stderr, "smoke: fi_enable\n");
 	rc = fi_enable(ep);
 	if (check(rc, "fi_enable"))
@@ -216,6 +278,12 @@ int main(int argc, char **argv)
 	if (check(rc, "fi_close(MR)"))
 		goto out;
 	mr = NULL;
+	for (i = 0; i < UET_PROVIDER_SMOKE_EXTRA_MRS; i++) {
+		rc = fi_close(&extra_mrs[i]->fid);
+		if (check(rc, "fi_close(extra MR)"))
+			goto out;
+		extra_mrs[i] = NULL;
+	}
 
 	/* The engine waits for its close lifetime before removing the address.
 	 * Once close returns, the index may be allocated again without colliding
@@ -245,6 +313,13 @@ int main(int argc, char **argv)
 
 out:
 	fprintf(stderr, "smoke: cleanup\n");
+	for (i = 0; i < UET_PROVIDER_SMOKE_EXTRA_MRS; i++) {
+		if (!extra_mrs[i])
+			continue;
+		close_rc = fi_close(&extra_mrs[i]->fid);
+		if (close_rc && !rc)
+			rc = check(close_rc, "fi_close(extra MR)");
+	}
 	if (mr) {
 		close_rc = fi_close(&mr->fid);
 		if (close_rc && !rc)

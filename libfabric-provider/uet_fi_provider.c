@@ -138,6 +138,7 @@ static int uet_fi_getinfo(uint32_t version, const char *node,
 	void **addr_out;
 	size_t *addrlen_out;
 	uint64_t caps;
+	size_t requested_mr_cnt;
 	bool have_node;
 	int rc;
 
@@ -203,7 +204,10 @@ static int uet_fi_getinfo(uint32_t version, const char *node,
 	info->domain_attr->mr_iov_limit = UET_FI_IOV_LIMIT;
 	info->domain_attr->caps = caps;
 	info->domain_attr->mode = info->mode;
-	info->domain_attr->mr_cnt = UET_DEF_MR_CNT;
+	requested_mr_cnt = hints && hints->domain_attr ?
+		hints->domain_attr->mr_cnt : 0;
+	info->domain_attr->mr_cnt = requested_mr_cnt > UET_FI_DEFAULT_MR_CNT ?
+		requested_mr_cnt : UET_FI_DEFAULT_MR_CNT;
 	info->fabric_attr->prov_version = uet_fi_provider.version;
 	info->fabric_attr->api_version = version;
 
