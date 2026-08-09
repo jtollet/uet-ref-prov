@@ -23,6 +23,11 @@ negative_client_bin="$plugin_build_dir/bin/uet_vpp_spsc_negative"
 owner_probe_bin="$plugin_build_dir/bin/uet_vpp_owner_probe"
 dma_auth_probe_bin="$plugin_build_dir/bin/uet_dma_auth_probe"
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+svm_abi_header="$script_dir/../uet/svm_abi.h"
+svm_abi_major=$(sed -n \
+  's/^#define UET_VPP_SVM_ABI_MAJOR[[:space:]][[:space:]]*//p' "$svm_abi_header")
+svm_abi_minor=$(sed -n \
+  's/^#define UET_VPP_SVM_ABI_MINOR[[:space:]][[:space:]]*//p' "$svm_abi_header")
 runtime_dir=$(mktemp -d /tmp/uet-vpp-svm.XXXXXX)
 config_file="$runtime_dir/startup.conf"
 stdout_file="$runtime_dir/stdout.log"
@@ -118,7 +123,7 @@ grep -q '^state enabled$' <<<"$status"
 grep -q '^owner-worker .* (1)$' <<<"$status"
 grep -q '^svm-state attached$' <<<"$status"
 grep -q "^svm-segment $segment_name$" <<<"$status"
-grep -q '^svm-abi 4\.1$' <<<"$status"
+grep -q "^svm-abi ${svm_abi_major}\\.${svm_abi_minor}$" <<<"$status"
 grep -q "^svm-queue-depth $queue_depth$" <<<"$status"
 grep -q "^svm-dma-slot-count $queue_depth$" <<<"$status"
 grep -Eq '^svm-dma-buffer-data-size [1-9][0-9]*$' <<<"$status"
