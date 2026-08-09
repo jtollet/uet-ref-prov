@@ -197,24 +197,24 @@ int main(int argc, char **argv)
 	if (check(rc, "fi_endpoint"))
 		goto out;
 	{
-		size_t inject_size = 0;
-		size_t optlen = sizeof(inject_size);
+		size_t option_value = 0;
+		size_t optlen = sizeof(option_value);
 
 		fprintf(stderr, "smoke: unsupported endpoint options\n");
 		rc = fi_getopt(&ep->fid, FI_OPT_ENDPOINT,
-			       FI_OPT_INJECT_MSG_SIZE, &inject_size, &optlen);
+			       FI_OPT_SEND_BUF_SIZE, &option_value, &optlen);
 		if (rc != -FI_ENOPROTOOPT) {
 			fprintf(stderr,
-				"fi_getopt(inject size): expected %d, got %d\n",
+				"fi_getopt(send buffer): expected %d, got %d\n",
 				-FI_ENOPROTOOPT, rc);
 			goto out;
 		}
 		rc = fi_setopt(&ep->fid, FI_OPT_ENDPOINT,
-			       FI_OPT_INJECT_MSG_SIZE, &inject_size,
-			       sizeof(inject_size));
+			       FI_OPT_SEND_BUF_SIZE, &option_value,
+			       sizeof(option_value));
 		if (rc != -FI_ENOPROTOOPT) {
 			fprintf(stderr,
-				"fi_setopt(inject size): expected %d, got %d\n",
+				"fi_setopt(send buffer): expected %d, got %d\n",
 				-FI_ENOPROTOOPT, rc);
 			goto out;
 		}
