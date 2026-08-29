@@ -72,6 +72,12 @@ plus zero-copy RX/release rings over a VPP-exported physmem mapping. The `vpp`
 NIC shim connects the traditional provider to this adapter. RX is entered only
 through VPP's IPv4/IPv6 local dispatch for IP protocol 253 or UDP port 49150;
 transit packets remain in the routing graph.
+
+See the VPP plugin
+[`GETTING_STARTED.md`](vpp-plugin/GETTING_STARTED.md) guide for a reproducible
+build and an end-to-end `fi_pingpong` test using two isolated VPP instances and
+temporary AF_PACKET/`veth` interfaces, without requiring a physical NIC.
+
 A DMA descriptor is exported only when the Unix peer PID matches a ready SSVM
 channel; authorized clients remain trusted because zero-copy RX currently
 requires mapping VPP's complete default buffer pool.

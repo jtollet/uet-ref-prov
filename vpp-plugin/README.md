@@ -13,6 +13,9 @@ functional interoperability path. A direct high-performance libfabric
 provider integration, exposing the shared DMA arena to applications, remains
 future work.
 
+For a reproducible source build and an end-to-end `fi_pingpong` validation on
+temporary AF_PACKET/`veth` interfaces, see [`GETTING_STARTED.md`](GETTING_STARTED.md).
+
 ## Why VPP
 
 The integration has two first-order benefits:
