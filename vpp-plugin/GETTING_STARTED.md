@@ -88,13 +88,16 @@ cd libfabric
 ./autogen.sh
 ./configure --disable-static --enable-only --enable-sockets=yes
 make -j"$(nproc)"
+test -x util/fi_pingpong
 ```
 
 No libfabric installation is required. The provider and test use the library
-and `fi_pingpong` directly from this build tree. The lightweight sockets
-provider is enabled only because a libfabric build requires at least one
-built-in provider; the end-to-end test explicitly selects the external `uet`
-provider.
+and `fi_pingpong` directly from this build tree. `fi_pingpong` is the upstream
+libfabric test application built from `util/pingpong.c`; it is intentionally not
+copied into the UET repository. The final `test` command fails immediately if
+the libfabric build did not produce it. The lightweight sockets provider is
+enabled only because a libfabric build requires at least one built-in provider;
+the end-to-end test explicitly selects the external `uet` provider.
 
 ## 3. Check out PR #143
 
@@ -145,6 +148,13 @@ sudo ./vpp-plugin/tests/af_packet_pingpong.sh \
   "$UET_VPP_PREFIX" \
   "$UET_EVAL_ROOT/libfabric"
 ```
+
+`vpp-plugin/tests/af_packet_pingpong.sh` is the only UET-owned test script
+required for this end-to-end path, and it is included in PR #143. It invokes
+the `fi_pingpong` executable built in step 2; no separately downloaded test
+script or binary is required. The other files under `vpp-plugin/tests/` provide
+the optional internal plugin validation described in step 6 and are also part
+of the PR.
 
 The privileged wrapper provisions, controls, and removes the temporary network
 namespaces and `veth` interfaces. When the script is invoked through `sudo`,
