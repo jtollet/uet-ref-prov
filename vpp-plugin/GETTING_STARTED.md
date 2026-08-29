@@ -1,7 +1,7 @@
 # Getting started with the UET VPP dataplane
 
 This guide builds a known-compatible VPP from source and validates pull
-request #130 through an unmodified libfabric application. The validation uses
+request #143 through an unmodified libfabric application. The validation uses
 two Linux network namespaces and VPP AF_PACKET interfaces connected by a
 temporary `veth` pair. It does not require a physical NIC, DPDK device binding,
 VFs, or XDP.
@@ -32,7 +32,7 @@ for performance measurements.
 
 ## 1. Clone and build VPP
 
-Start from an empty working directory. PR #130 was validated with VPP commit
+Start from an empty working directory. PR #143 was validated with VPP commit
 `a4b80adfcf792ba8a59ef0f3a9687842333269dd`. Use this pinned revision for the
 first test so that the runtime, development files, and external plugin have the
 same API and ABI.
@@ -77,7 +77,7 @@ The local install remains under the evaluation directory; it does not modify
 
 ## 2. Clone and build libfabric
 
-PR #130 was validated with libfabric 1.20.1.
+PR #143 was validated with libfabric 1.20.1.
 
 ```sh
 cd "$UET_EVAL_ROOT"
@@ -96,16 +96,15 @@ provider is enabled only because a libfabric build requires at least one
 built-in provider; the end-to-end test explicitly selects the external `uet`
 provider.
 
-## 3. Check out PR #130
+## 3. Check out PR #143
 
-Repository access may require the credentials supplied to UEC working-group
-members.
+The UET reference repository and PR are public.
 
 ```sh
 cd "$UET_EVAL_ROOT"
 git clone https://github.com/ultraethernet/uet-ref-prov.git
-git -C uet-ref-prov fetch origin pull/130/head:pr-130
-git -C uet-ref-prov switch pr-130
+git -C uet-ref-prov fetch origin pull/143/head:pr-143
+git -C uet-ref-prov switch pr-143
 ```
 
 ## 4. Build the external VPP plugin and UET provider
@@ -134,7 +133,7 @@ This produces the following relevant components:
 | `libuet_vpp_client.so` | Provider-facing SSVM and buffer-exchange API. |
 | `uet_plugin.so` | Out-of-tree VPP dataplane plugin. |
 
-The VPP source tree remains unmodified; PR #130 is built as an external plugin
+The VPP source tree remains unmodified; PR #143 is built as an external plugin
 against the SDK produced in step 1.
 
 ## 5. Run the AF_PACKET end-to-end test
