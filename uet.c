@@ -130,7 +130,31 @@ void UET_USAGE(char *cmd)
 	         "    UET_FORCE_RUDI=1  force RUDI (reliable unordered, idempotent)\n"
 	         "                      on the 'rma' command\n"
 	         "    UET_FORCE_UUD=1   force UUD (unreliable datagram, best-effort)\n"
-	         "                      on the 'uud' command\n",
+	         "                      on the 'uud' command\n"
+	         "\n"
+	         "  Memory region overrides (env vars):\n"
+	         "    UET_MR_IOV=<n>    register the RMA memory region as <n>\n"
+	         "                      iovec entries (uet_mr_regv) instead of\n"
+	         "                      one contiguous region. Same bytes, same\n"
+	         "                      order - exercises UET_MR_BUF_TYPE_IOV.\n"
+	         "                      Applies to rma/sync_rma/atomic tests.\n"
+	         "    UET_MR_PBL=<sz>   register the RMA memory region as a page\n"
+	         "                      buffer list with <sz> byte pages, as a\n"
+	         "                      device driver would. Same bytes, same\n"
+	         "                      order. Takes precedence over UET_MR_IOV.\n"
+	         "    UET_MR_PBL_LEVEL=<n> PBL level: 0 contiguous, 1 one-level\n"
+	         "                      page directory (default), 2 two-level.\n"
+	         "    UET_MR_PBL_OFFSET=<n> start the region <n> bytes into its\n"
+	         "                      first page, as an unaligned base VA\n"
+	         "                      does. Must be less than the page size.\n"
+	         "    UET_LOCAL_SEG=<n> describe the LOCAL rma buffer as <n>\n"
+	         "                      segments naming memory regions rather\n"
+	         "                      than as a process address, using the\n"
+	         "                      uet_*seg apis.\n"
+	         "    UET_LOCAL_SEG_MRS=<m> spread those segments over <m>\n"
+	         "                      distinct regions, so one operation\n"
+	         "                      crosses several lkeys as a multi-SGE\n"
+	         "                      work request does.\n",
 	         cmd);
 }
 
@@ -149,6 +173,27 @@ struct uet_cfg {
 	bool unexpected_msg_test;  /* true => this is unexpected message test */
 	bool dsend_test;                        /* true => this is dsend test */
 	bool iov_test;                               /* true => test uses iov */
+	         /* When > 1, the RMA memory region is registered with        */
+	         /* uet_mr_regv() as this many iovec entries carved from the  */
+	         /* same buffer, exercising UET_MR_BUF_TYPE_IOV. 0 or 1 keeps */
+	         /* the contiguous registration. Set via UET_MR_IOV.          */
+	size_t mr_iov_count;
+	         /* When non-zero, the RMA memory region is registered with   */
+	         /* uet_mr_reg_pbl() using this page size. Set via UET_MR_PBL.*/
+	size_t mr_pbl_page_size;
+	int mr_pbl_level;              /* PBL level, set via UET_MR_PBL_LEVEL */
+	         /* Offset of the region within its first page, exercising    */
+	         /* the unaligned base VA a real driver may see. Set via      */
+	         /* UET_MR_PBL_OFFSET.                                        */
+	size_t mr_pbl_page_offset;
+	         /* When > 0, rma operations describe their LOCAL buffer as   */
+	         /* this many segments over memory regions instead of as a    */
+	         /* process address. Set via UET_LOCAL_SEG.                   */
+	size_t local_seg_count;
+	         /* Spread those segments across this many distinct regions,  */
+	         /* which is the multi-lkey case a single-region design       */
+	         /* cannot express. Set via UET_LOCAL_SEG_MRS.                */
+	size_t local_seg_mrs;
 	int num_iterations;                 /* number of messages to exchange */
 	size_t msg_size;                         /* size of messages in bytes */
 	char *peer_ip_addr_string;             /* peer ip addr in string form */
@@ -192,7 +237,23 @@ struct uet_context {
 	uint8_t tx_count;
 	struct iovec *rx_iov;
 	uint8_t rx_count;
-	uet_mr_handle_t mr_handle;           /*handle for local memory region */
+	uet_mr_handle_t mr_handle;          /* handle for local memory region */
+	uet_dma_addr_t *pbl_root;      /* page dir (L-1) or dir of dirs (L-2) */
+	uet_dma_addr_t **pbl_mid;                   /* L-2 middle directories */
+	size_t pbl_mid_cnt;
+	        /* The region's pages, individually allocated and mapped to   */
+	        /* region page N in a deliberately permuted order, so that a  */
+	        /* wrong page index yields wrong data rather than the right   */
+	        /* bytes by accident.                                         */
+	uint8_t **pbl_pages;
+	size_t pbl_page_cnt;
+	uint8_t *pbl_base;                       /* L-0 the single allocation */
+	        /* local buffer expressed as segments, and the extra regions  */
+	        /* those segments name when more than one is asked for        */
+	struct uet_mr_seg *local_seg;
+	size_t local_seg_count;
+	uet_mr_handle_t *extra_mr;
+	size_t extra_mr_cnt;
 	/* buf addr and key for memory regions */
 	struct uet_mem_region_info local_mr, remote_mr;
 };
@@ -289,6 +350,51 @@ static void uet_free_res(struct uet_context *ctx)
 		ctx->rx_msg = NULL;
 	}
 
+	if (ctx->local_seg) {
+		free(ctx->local_seg);
+		ctx->local_seg = NULL;
+		ctx->local_seg_count = 0;
+	}
+
+	if (ctx->extra_mr) {
+		free(ctx->extra_mr);
+		ctx->extra_mr = NULL;
+		ctx->extra_mr_cnt = 0;
+	}
+
+	if (ctx->pbl_mid) {
+		size_t i;
+
+		for (i = 0; i < ctx->pbl_mid_cnt; i++)
+			free(ctx->pbl_mid[i]);
+
+		free(ctx->pbl_mid);
+		ctx->pbl_mid = NULL;
+		ctx->pbl_mid_cnt = 0;
+	}
+
+	if (ctx->pbl_root) {
+		free(ctx->pbl_root);
+		ctx->pbl_root = NULL;
+	}
+
+	if (ctx->pbl_pages) {
+		size_t i;
+
+		for (i = 0; i < ctx->pbl_page_cnt; i++)
+			free(ctx->pbl_pages[i]);
+
+		free(ctx->pbl_pages);
+		ctx->pbl_pages = NULL;
+		ctx->pbl_page_cnt = 0;
+	}
+
+	if (ctx->pbl_base) {
+		free(ctx->pbl_base);
+		ctx->pbl_base = NULL;
+		ctx->mr_buf = NULL;
+	}
+
 	if (ctx->mr_buf) {
 		free(ctx->mr_buf);
 		ctx->mr_buf = NULL;
@@ -351,6 +457,66 @@ static uet_rc_t uet_init_cfg(int argc, char *argv[],
 	 * message size is capped to a single packet.
 	 */
 	ctx->cfg.uud = (getenv("UET_FORCE_UUD") != NULL);
+
+	/* When UET_MR_IOV=<n> is set with n > 1, the RMA memory region is
+	 * registered with uet_mr_regv() as n iovec entries carved from the
+	 * same buffer instead of one contiguous region.
+	 */
+	{
+		const char *mr_iov = getenv("UET_MR_IOV");
+
+		ctx->cfg.mr_iov_count =
+			(mr_iov != NULL) ?
+				(size_t)strtoul(mr_iov, NULL, 0) :
+				0;
+	}
+
+	/* When UET_MR_PBL=<page_size> is set, the RMA memory region is
+	 * registered with uet_mr_reg_pbl() as a page buffer list. The pages
+	 * are separately allocated and deliberately permuted, so a resolver
+	 * that computes the wrong page index returns the wrong bytes rather
+	 * than accidentally-correct adjacent ones.
+	 */
+	{
+		const char *pbl = getenv("UET_MR_PBL");
+		const char *lvl = getenv("UET_MR_PBL_LEVEL");
+		const char *po  = getenv("UET_MR_PBL_OFFSET");
+
+		ctx->cfg.mr_pbl_page_size =
+			(pbl != NULL) ?
+				(size_t)strtoul(pbl, NULL, 0) :
+				0;
+
+		ctx->cfg.mr_pbl_level =
+			(lvl != NULL) ?
+				(int)strtol(lvl, NULL, 0) :
+				UET_PBL_LEVEL_1;
+
+		ctx->cfg.mr_pbl_page_offset =
+			(po != NULL) ?
+				(size_t)strtoul(po, NULL, 0) :
+				0;
+	}
+
+	/* When UET_LOCAL_SEG=<n> is set, rma operations describe their local
+	 * buffer as n segments naming memory regions, rather than as a
+	 * process address. UET_LOCAL_SEG_MRS=<m> spreads those segments over
+	 * m distinct regions, so one operation crosses several lkeys.
+	 */
+	{
+		const char *ls = getenv("UET_LOCAL_SEG");
+		const char *lm = getenv("UET_LOCAL_SEG_MRS");
+
+		ctx->cfg.local_seg_count =
+			(ls != NULL) ?
+				(size_t)strtoul(ls, NULL, 0) :
+				0;
+
+		ctx->cfg.local_seg_mrs =
+			(lm != NULL) ?
+				(size_t)strtoul(lm, NULL, 0) :
+				1;
+	}
 
 	if (argc == 4) {
 		if (strcmp(argv[2], "tag") != 0) {
@@ -469,13 +635,54 @@ static void uet_init_iov_buf(size_t size, uint8_t *buf)
 }
 
 
+/*
+ * Move the region's contents between the linear shadow buffer and the
+ * scattered pages the page list actually describes.
+ *
+ * When the pages are separately allocated and permuted, mr_buf is no longer
+ * the region - it is only a linear image of it, used to lay down the test
+ * pattern and to verify what came back. Everything the provider touches
+ * goes through the pages.
+ */
+static void uet_pbl_sync(struct uet_context *ctx, bool to_pages)
+{
+	size_t ps = ctx->cfg.mr_pbl_page_size;
+	size_t off = ctx->cfg.mr_pbl_page_offset;
+	size_t done = 0;
+
+	if (ctx->pbl_pages == NULL)
+		return; /* level 0: the region is mr_buf itself */
+
+	while (done < ctx->cfg.msg_size) {
+		size_t abs = (off + done);
+		size_t run = (ps - (abs % ps));
+		uint8_t *p = (ctx->pbl_pages[abs / ps] + (abs % ps));
+
+		if (run > (ctx->cfg.msg_size - done))
+			run = (ctx->cfg.msg_size - done);
+
+		if (to_pages)
+			memcpy(p, (ctx->mr_buf + done), run);
+		else
+			memcpy((ctx->mr_buf + done), p, run);
+
+		done += run;
+	}
+}
+
 /* validate message buffer contents */
 static uet_rc_t uet_validate_msg(struct uet_context *ctx, uint8_t *buf)
 {
 	size_t i;
 
+	/* The rma target is the page list, not this buffer, refresh the
+	 * linear image from the pages before checking it.
+	 */
+	if (buf == ctx->mr_buf)
+		uet_pbl_sync(ctx, false);
+
 	for (i = 0; i < ctx->cfg.msg_size; i++) {
-		if (buf[i] != (uint8_t) i)
+		if (buf[i] != (uint8_t)i)
 			return UET_ERR_RC;
 	}
 
@@ -640,16 +847,217 @@ static uet_rc_t uet_init_transport(struct uet_context *ctx)
 		 * IDEMPOTENT_SAFE. The provider still assigns the key but
 		 * preserves this flag.
 		 */
-		ret = uet_mr_reg(ctx->domain_handle, ctx->mr_buf,
-				 ctx->cfg.msg_size,
-				 FI_WRITE | FI_REMOTE_WRITE |
-				 FI_READ  | FI_REMOTE_READ | FI_ATOMIC,
-				 ctx->cfg.rudi ? UET_MR_KEY_IDEMPOTENT_SAFE :
-						 UET_MR_KEY_NONE,
-				 UET_FLAGS_NONE, context,
-				 &ctx->mr_handle);
+
+		if (ctx->cfg.mr_pbl_page_size > 0) {
+			size_t ps = ctx->cfg.mr_pbl_page_size;
+			size_t po = ctx->cfg.mr_pbl_page_offset;
+			size_t npages = (po + ctx->cfg.msg_size + ps - 1) / ps;
+			size_t per_dir = ps / sizeof(uet_dma_addr_t);
+			uet_dma_addr_t root;
+			uint8_t **raw = NULL;
+			size_t i;
+
+			if (po >= ps) {
+				UET_ERR("UET_MR_PBL_OFFSET must be < page size");
+				goto exit;
+			}
+
+			if (ctx->cfg.mr_pbl_level == UET_PBL_LEVEL_0) {
+				/*
+				 * level 0 is contiguous by definition, so the
+				 * region is one allocation and page_offset is
+				 * simply where it starts inside it
+				 */
+				ctx->pbl_base = calloc(1, po +
+						       ctx->cfg.msg_size);
+				if (ctx->pbl_base == NULL) {
+					UET_ERR("Error allocating PBL region");
+					goto exit;
+				}
+				memcpy(ctx->pbl_base + po, ctx->mr_buf,
+				       ctx->cfg.msg_size);
+				free(ctx->mr_buf);
+				ctx->mr_buf = ctx->pbl_base + po;
+				root = (uet_dma_addr_t) (uintptr_t)
+					ctx->pbl_base;
+			} else {
+				/*
+				 * Allocate every page separately, then map
+				 * region page N to allocation (npages-1-N).
+				 * The permutation is what makes this a real
+				 * test: if the resolver computes the wrong
+				 * page index it returns the wrong bytes
+				 * instead of adjacent - and therefore
+				 * accidentally correct - ones.
+				 */
+				raw = calloc(npages, sizeof(uint8_t *));
+				ctx->pbl_pages = calloc(npages,
+							sizeof(uint8_t *));
+				if ((raw == NULL) || (ctx->pbl_pages == NULL)) {
+					free(raw);
+					UET_ERR("Error allocating PBL pages");
+					goto exit;
+				}
+				ctx->pbl_page_cnt = npages;
+
+				for (i = 0; i < npages; i++) {
+					raw[i] = calloc(1, ps);
+					if (raw[i] == NULL) {
+						free(raw);
+						UET_ERR(
+						"Error allocating PBL page");
+						goto exit;
+					}
+				}
+				for (i = 0; i < npages; i++)
+					ctx->pbl_pages[i] =
+						raw[npages - 1 - i];
+				free(raw);
+
+				/* lay the region's contents into the pages */
+				uet_pbl_sync(ctx, true);
+
+				if (ctx->cfg.mr_pbl_level == UET_PBL_LEVEL_1) {
+					ctx->pbl_root = calloc(npages,
+						sizeof(uet_dma_addr_t));
+					if (ctx->pbl_root == NULL) {
+						UET_ERR(
+						"Error allocating PBL dir");
+						goto exit;
+					}
+					for (i = 0; i < npages; i++)
+						ctx->pbl_root[i] =
+							(uet_dma_addr_t)
+							(uintptr_t)
+							ctx->pbl_pages[i];
+				} else if (ctx->cfg.mr_pbl_level ==
+					   UET_PBL_LEVEL_2) {
+					size_t ndirs = (npages + per_dir - 1) /
+						       per_dir;
+
+					ctx->pbl_root = calloc(ndirs,
+						sizeof(uet_dma_addr_t));
+					ctx->pbl_mid = calloc(ndirs,
+						sizeof(uet_dma_addr_t *));
+					if ((ctx->pbl_root == NULL) ||
+					    (ctx->pbl_mid == NULL)) {
+						UET_ERR(
+						"Error allocating PBL dirs");
+						goto exit;
+					}
+					ctx->pbl_mid_cnt = ndirs;
+					for (i = 0; i < ndirs; i++) {
+						ctx->pbl_mid[i] = calloc(1, ps);
+						if (ctx->pbl_mid[i] == NULL) {
+							UET_ERR(
+							"Error alloc PBL dir");
+							goto exit;
+						}
+						ctx->pbl_root[i] =
+							(uet_dma_addr_t)
+							(uintptr_t)
+							ctx->pbl_mid[i];
+					}
+					for (i = 0; i < npages; i++)
+						ctx->pbl_mid[i / per_dir]
+							   [i % per_dir] =
+							(uet_dma_addr_t)
+							(uintptr_t)
+							ctx->pbl_pages[i];
+				} else {
+					UET_ERR("Invalid UET_MR_PBL_LEVEL");
+					goto exit;
+				}
+
+				root = (uet_dma_addr_t) (uintptr_t)
+					ctx->pbl_root;
+			}
+
+			printf("Registering MR as a level-%d PBL "
+			       "(%zu pages of %zu bytes, page_offset %zu%s)\n",
+			       ctx->cfg.mr_pbl_level, npages, ps, po,
+			       (ctx->pbl_pages != NULL) ?
+					", pages permuted" : "");
+
+			/* base_va 0 makes the region zero-based, so the
+			 * addresses naming it are offsets
+			 */
+			ret = uet_mr_reg_pbl(ctx->domain_handle, root,
+					     (uint32_t) ps,
+					     ctx->cfg.mr_pbl_level,
+					     (uint32_t) po,
+					     0 /* base_va */,
+					     ctx->cfg.msg_size,
+					     FI_WRITE | FI_REMOTE_WRITE |
+					     FI_READ  | FI_REMOTE_READ |
+					     FI_ATOMIC,
+					     ctx->cfg.rudi ?
+						UET_MR_KEY_IDEMPOTENT_SAFE :
+						UET_MR_KEY_NONE,
+					     UET_FLAGS_NONE, context,
+					     &ctx->mr_handle);
+		} else if (ctx->cfg.mr_iov_count > 1) {
+			struct iovec *mr_iov;
+			size_t i, off, chunk;
+			size_t n = ctx->cfg.mr_iov_count;
+
+			/* cannot carve more entries than there are bytes */
+			if (n > ctx->cfg.msg_size)
+				n = ctx->cfg.msg_size;
+
+			mr_iov = calloc(n, sizeof(struct iovec));
+			if (mr_iov == NULL) {
+				UET_PRINT_ERRNO("calloc");
+				UET_ERR("Error allocating MR io vector");
+				goto exit;
+			}
+
+			/*
+			 * carve the same buffer into n adjacent slices - the
+			 * bytes and their order are unchanged, so all existing
+			 * data verification still applies
+			 */
+			chunk = ctx->cfg.msg_size / n;
+			off = 0;
+			for (i = 0; i < n; i++) {
+				mr_iov[i].iov_base = ctx->mr_buf + off;
+				/* last entry absorbs any remainder */
+				mr_iov[i].iov_len = (i == (n - 1)) ?
+					(ctx->cfg.msg_size - off) : chunk;
+				off += mr_iov[i].iov_len;
+			}
+
+			printf("Registering MR as %zu iovec entries (%zu bytes)\n",
+			       n, ctx->cfg.msg_size);
+
+			/* uet_mr_regv() copies the vector, so it need not
+			 * outlive this call
+			 */
+			ret = uet_mr_regv(ctx->domain_handle, mr_iov, n,
+					  FI_WRITE | FI_REMOTE_WRITE |
+					  FI_READ  | FI_REMOTE_READ | FI_ATOMIC,
+					  ctx->cfg.rudi ?
+						UET_MR_KEY_IDEMPOTENT_SAFE :
+						UET_MR_KEY_NONE,
+					  UET_FLAGS_NONE, context,
+					  &ctx->mr_handle);
+			free(mr_iov);
+		} else {
+			ret = uet_mr_reg(ctx->domain_handle, ctx->mr_buf,
+					 ctx->cfg.msg_size,
+					 FI_WRITE | FI_REMOTE_WRITE |
+					 FI_READ  | FI_REMOTE_READ | FI_ATOMIC,
+					 ctx->cfg.rudi ?
+						UET_MR_KEY_IDEMPOTENT_SAFE :
+						UET_MR_KEY_NONE,
+					 UET_FLAGS_NONE, context,
+					 &ctx->mr_handle);
+		}
 		if (ret) {
-			UET_ERR("uet_mr_reg: %s", fi_strerror(-ret));
+			UET_ERR("uet_mr_reg%s: %s",
+				(ctx->cfg.mr_pbl_page_size > 0) ? "_pbl" :
+				((ctx->cfg.mr_iov_count > 1) ? "v" : ""),
+				fi_strerror(-ret));
 			goto exit;
 		}
 
@@ -718,6 +1126,119 @@ static uet_rc_t uet_init_transport(struct uet_context *ctx)
 		if (ret) {
 			UET_ERR("uet_mr_enable: %s", fi_strerror(-ret));
 			goto exit;
+		}
+
+		/*
+		 * Describe the local rma buffer as a segment list instead of
+		 * a process address. The segments carve the same region so
+		 * the bytes and their order are unchanged and every existing
+		 * verification still applies (only the way the buffer is
+		 * named changes. With UET_LOCAL_SEG_MRS the carve is spread
+		 * over several separately registered regions covering the
+		 * same memory, so one operation genuinely crosses several
+		 * lkeys, which is what a multi-SGE work request does.
+		 */
+		if (ctx->cfg.local_seg_count > 0) {
+			size_t nseg = ctx->cfg.local_seg_count;
+			size_t nmr = ctx->cfg.local_seg_mrs;
+			size_t chunk, off, i;
+
+			/*
+			 * sync_rma issues partial writes straight from
+			 * mr_buf, which is only a linear shadow of the region
+			 * when the region is a page list. Segment operations
+			 * land in the pages themselves, so mixing the two
+			 * leaves the shadow stale and the data check fails on
+			 * a harness artifact rather than a real defect.
+			 *
+			 * Each half is fine on its own - segments with a
+			 * contiguous region, or a page list without segments -
+			 * so refuse only the combination, and say why.
+			 */
+			if ((ctx->cfg.mr_pbl_page_size > 0) &&
+			    ctx->cfg.sync_rma) {
+				UET_ERR("UET_LOCAL_SEG with UET_MR_PBL is "
+					"not supported for sync_rma:");
+				UET_ERR("  sync_rma writes partial buffers "
+					"directly from the shadow buffer,");
+				UET_ERR("  which segment operations bypass. "
+					"Use one or the other.");
+				goto exit;
+			}
+
+			if (nseg > ctx->cfg.msg_size)
+				nseg = ctx->cfg.msg_size;
+			if (nmr < 1)
+				nmr = 1;
+			if (nmr > nseg)
+				nmr = nseg;
+
+			ctx->local_seg = calloc(nseg,
+						sizeof(struct uet_mr_seg));
+			if (ctx->local_seg == NULL) {
+				UET_ERR("Error allocating local segments");
+				goto exit;
+			}
+			ctx->local_seg_count = nseg;
+
+			/*
+			 * Extra regions beyond the first each cover the whole
+			 * buffer; a segment then names a slice of whichever
+			 * region it was assigned. Registering the same memory
+			 * more than once is exactly what distinct lkeys over
+			 * overlapping memory look like.
+			 */
+			if (nmr > 1) {
+				ctx->extra_mr = calloc(nmr - 1,
+						sizeof(uet_mr_handle_t));
+				if (ctx->extra_mr == NULL) {
+					UET_ERR("Error allocating extra MRs");
+					goto exit;
+				}
+
+				for (i = 0; i < (nmr - 1); i++) {
+					ret = uet_mr_reg(ctx->domain_handle,
+						ctx->mr_buf, ctx->cfg.msg_size,
+						FI_WRITE | FI_REMOTE_WRITE |
+						FI_READ | FI_REMOTE_READ |
+						FI_ATOMIC,
+						UET_MR_KEY_NONE,
+						UET_FLAGS_NONE, context,
+						&ctx->extra_mr[i]);
+					if (ret == 0)
+						ret = uet_ep_bind_mr(
+							ctx->ep_handle,
+							ctx->extra_mr[i],
+							UET_FLAGS_NONE);
+					if (ret == 0)
+						ret = uet_mr_enable(
+							ctx->extra_mr[i]);
+					if (ret) {
+						UET_ERR("extra MR %zu: %s", i,
+							fi_strerror(-ret));
+						goto exit;
+					}
+					ctx->extra_mr_cnt++;
+				}
+			}
+
+			chunk = ctx->cfg.msg_size / nseg;
+			off = 0;
+			for (i = 0; i < nseg; i++) {
+				size_t which = i % nmr;
+
+				ctx->local_seg[i].mr = (which == 0) ?
+					ctx->mr_handle :
+					ctx->extra_mr[which - 1];
+				ctx->local_seg[i].addr = off;
+				ctx->local_seg[i].len = (i == (nseg - 1)) ?
+					(ctx->cfg.msg_size - off) : chunk;
+				off += ctx->local_seg[i].len;
+			}
+
+			printf("Local rma buffer as %zu segments "
+			       "over %zu region(s)\n",
+			       nseg, nmr);
 		}
 	}
 
@@ -1002,6 +1523,44 @@ static uet_rc_t uet_rma_server_ctrl_exchange(struct uet_context *ctx)
 	return UET_SUCCESS_RC;
 }
 
+/*
+ * rma write / read, using the segment form of the api when the local buffer
+ * has been described as segments. The two forms move identical bytes; only
+ * how the local buffer is named differs.
+ */
+
+static ssize_t uet_test_write(struct uet_context *ctx, uint64_t *imm_data,
+			      size_t len, void *context)
+{
+	if ((ctx->local_seg != NULL) && (len == ctx->cfg.msg_size))
+		return uet_writeseg(ctx->ep_handle, ctx->cfg.job_id,
+				    ctx->local_seg, ctx->local_seg_count,
+				    imm_data, ctx->peer_addr_handle,
+				    ctx->remote_mr.rma_buf_addr,
+				    ctx->remote_mr.key, context);
+
+	return uet_write(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf, len,
+			 imm_data, ctx->mr_handle, ctx->peer_addr_handle,
+			 ctx->remote_mr.rma_buf_addr, ctx->remote_mr.key,
+			 context);
+}
+
+static ssize_t uet_test_read(struct uet_context *ctx, size_t len,
+			     void *context)
+{
+	if ((ctx->local_seg != NULL) && (len == ctx->cfg.msg_size))
+		return uet_readseg(ctx->ep_handle, ctx->cfg.job_id,
+				   ctx->local_seg, ctx->local_seg_count,
+				   ctx->peer_addr_handle,
+				   ctx->remote_mr.rma_buf_addr,
+				   ctx->remote_mr.key, context);
+
+	return uet_read(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf, len,
+			ctx->mr_handle, ctx->peer_addr_handle,
+			ctx->remote_mr.rma_buf_addr, ctx->remote_mr.key,
+			context);
+}
+
 static uet_rc_t uet_rma_write_data(struct uet_context *ctx, uint64_t *imm_data)
 {
 	struct fi_cq_data_entry cq_entry;
@@ -1014,11 +1573,7 @@ static uet_rc_t uet_rma_write_data(struct uet_context *ctx, uint64_t *imm_data)
 	 */
 	if (ctx->cfg.rudi) {
 		/* bulk data over RUDI (no immediate) */
-		ret = uet_write(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf,
-				ctx->cfg.msg_size, NULL, ctx->mr_handle,
-				ctx->peer_addr_handle,
-				ctx->remote_mr.rma_buf_addr,
-				ctx->remote_mr.key, NULL);
+		ret = uet_test_write(ctx, NULL, ctx->cfg.msg_size, NULL);
 		if (ret < 0) {
 			UET_ERR("uet_write (RUDI data): %s", fi_strerror(-ret));
 			return UET_ERR_RC;
@@ -1031,11 +1586,7 @@ static uet_rc_t uet_rma_write_data(struct uet_context *ctx, uint64_t *imm_data)
 		}
 
 		/* signal over RUD (zero-length write-with-immediate) */
-		ret = uet_write(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf,
-				0, imm_data, ctx->mr_handle,
-				ctx->peer_addr_handle,
-				ctx->remote_mr.rma_buf_addr,
-				ctx->remote_mr.key, NULL);
+		ret = uet_test_write(ctx, imm_data, 0, NULL);
 		if (ret < 0) {
 			UET_ERR("uet_write (RUD imm): %s", fi_strerror(-ret));
 			return UET_ERR_RC;
@@ -1051,10 +1602,7 @@ static uet_rc_t uet_rma_write_data(struct uet_context *ctx, uint64_t *imm_data)
 	}
 
 	/* single write-with-immediate (data + target completion) */
-	ret = uet_write(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf,
-			ctx->cfg.msg_size, imm_data, ctx->mr_handle,
-			ctx->peer_addr_handle, ctx->remote_mr.rma_buf_addr,
-			ctx->remote_mr.key, NULL);
+	ret = uet_test_write(ctx, imm_data, ctx->cfg.msg_size, NULL);
 	if (ret < 0) {
 		UET_ERR("uet_write: %s", fi_strerror(-ret));
 		return UET_ERR_RC;
@@ -1090,10 +1638,7 @@ static uet_rc_t uet_rma_client(struct uet_context *ctx)
 	uint64_t imm_data = UET_WRITE_IMM_DATA;
 	struct fi_cq_data_entry cq_entry;
 
-	ret = uet_read(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf,
-			ctx->cfg.msg_size, ctx->mr_handle,
-			ctx->peer_addr_handle, ctx->remote_mr.rma_buf_addr,
-			ctx->remote_mr.key, context);
+	ret = uet_test_read(ctx, ctx->cfg.msg_size, context);
 	if (ret < 0) {
 		UET_ERR("uet_read: %s", fi_strerror(-ret));
 		return UET_ERR_RC;
@@ -1180,10 +1725,7 @@ static uet_rc_t uet_sync_rma_client(struct uet_context *ctx)
 	size_t msg1_sz, msg2_sz, msg3_sz;
 	struct fi_cq_data_entry cq_entry;
 
-	ret = uet_read(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf,
-			ctx->cfg.msg_size, ctx->mr_handle,
-			ctx->peer_addr_handle, ctx->remote_mr.rma_buf_addr,
-			ctx->remote_mr.key, context);
+	ret = uet_test_read(ctx, ctx->cfg.msg_size, context);
 	if (ret < 0) {
 		UET_ERR("uet_read: %s", fi_strerror(-ret));
 		return UET_ERR_RC;
@@ -1487,10 +2029,7 @@ static uet_rc_t uet_atomic_client(struct uet_context *ctx)
 		return UET_ERR_RC;
 	}
 
-	ret = uet_write(ctx->ep_handle, ctx->cfg.job_id, ctx->mr_buf,
-			ctx->cfg.msg_size, &imm_data, ctx->mr_handle,
-			ctx->peer_addr_handle, ctx->remote_mr.rma_buf_addr,
-			ctx->remote_mr.key, context);
+	ret = uet_test_write(ctx, &imm_data, ctx->cfg.msg_size, context);
 	if (ret < 0) {
 		UET_ERR("uet_write: %s", fi_strerror(-ret));
 		return UET_ERR_RC;

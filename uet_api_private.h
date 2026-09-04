@@ -21,8 +21,13 @@
 #ifndef _UET_API_PRIVATE_H_
 #define _UET_API_PRIVATE_H_
 
-#define UET_IOV_LIMIT     8
-#define UET_RMA_IOV_LIMIT 8
+/*
+ * Scatter/gather limits advertised to applications. These bound what an
+ * application may pass to the vector send/recv/rma calls; they do not bound
+ * how a memory region describes itself, which is an attribute of a page list.
+ */
+#define UET_IOV_LIMIT     64
+#define UET_RMA_IOV_LIMIT 64
 #if UET_IOV_LIMIT > UET_RMA_IOV_LIMIT
 	#define UET_IOV_LIMIT_MAX UET_IOV_LIMIT
 #else
@@ -98,8 +103,6 @@
 	fprintf(stdout, "UET_API: %s(): %s:%-4d, ret = %d (%s)\n",    \
 		(CALL), __FILE__, __LINE__, errno, strerror(errno))
 
-typedef uint64_t uet_dma_addr_t;
-
 /* endpoint states */
 typedef enum {
 	UET_EP_DISABLED = 0,
@@ -132,6 +135,9 @@ typedef enum {
 	UET_MR_BUF_TYPE_IOV,
 	UET_MR_BUF_TYPE_REGATTR_IOV,
 	UET_MR_BUF_TYPE_REGATTR_DMABUF,
+	        /* region described by a page buffer list, as a device driver */
+	        /* builds it after pinning the pages behind a user VA range   */
+	UET_MR_BUF_TYPE_PBL,
 } uet_mr_buf_type_t;
 
 /* descriptor for contiguous mr */
@@ -143,15 +149,36 @@ struct uet_mr_desc_contig {
 struct uet_mr_desc_iov {
 	size_t iov_count;                         /* number of entries in iov */
 	const struct iovec *iov;                  /* vector for memory region */
-			     /* array of base dma addresses for memory region */
-	uet_dma_addr_t dma_addr[UET_IOV_LIMIT_MAX];
+};
+
+/*
+ * Page buffer list (PBL) descriptor. The region is a run of uniform pages.
+ * Every page must be the same size so resolving an offset is arithmetic
+ * rather than a walk:
+ *
+ *   abs      = (page_offset + offset)
+ *   page_idx = (abs >> page_shift)
+ *   page_off = (abs & (page_size - 1))
+ *
+ * This is followed by zero, one, or two indirections depending on the level
+ * attribute. The page directories and data pages are named by dma addresses
+ * and are read in place on demand.
+ *
+ * level 0: the region's data pages themselves
+ * level 1: a directory of data page addresses
+ * level 2: a directory of a directory of data page addresses
+ */
+struct uet_mr_desc_pbl {
+	uet_dma_addr_t root;
+	uint32_t page_size;                     /* bytes per page, power of 2 */
+	uint32_t page_offset;       /* offset of the region in its first page */
+	uint8_t page_shift;                   /* log2(page_size), precomputed */
+	uet_pbl_level_t level;
 };
 
 /* descriptor for mr registered with uet_mr_regattr API */
 struct uet_mr_desc_regattr {
 	const struct fi_mr_attr *attr;
-			     /* array of base dma addresses for memory region */
-	uet_dma_addr_t dma_addr[UET_IOV_LIMIT_MAX];
 };
 
 /* memory region buffer descriptor */
@@ -163,6 +190,7 @@ struct uet_mr_buf_desc {
 		struct uet_mr_desc_contig contig;
 		struct uet_mr_desc_iov iov;
 		struct uet_mr_desc_regattr regattr;
+		struct uet_mr_desc_pbl pbl;
 	};
 };
 
@@ -175,6 +203,11 @@ struct uet_mr_desc {
 	uint64_t full_key;                      /* full key for memory region */
 	uint64_t access;            /* operations supported for memory region */
 	uint64_t flags;                        /* properties of memory region */
+	     /* Virtual address the region starts at, which is also what      */
+	     /* selects the addressing convention: 0 means addresses naming   */
+	     /* this region are offsets from zero, anything else means they   */
+	     /* are virtual addresses and this is subtracted from them.       */
+	uint64_t base_va;
 	uint32_t job_id;                 /* JobID the region is restricted to */
 	bool job_restricted;               /* region is restricted to a JobID */
 	bool user_key;            /* key is user-assigned (hash space) vs the */
@@ -205,6 +238,18 @@ struct uet_tag_initiator_key {
 typedef enum {
 	UET_MSG_BUF_TYPE_CONTIG = 0,
 	UET_MSG_BUF_TYPE_IOV,
+	       /* The data lives in the memory region referenced by the       */
+	       /* descriptor's mr_desc, and is reached through uet_mr_scatter */
+	       /* and uet_mr_gather. Used for rma at the target, where the    */
+	       /* region owns its own representation. Contiguous,             */
+	       /* scatter/gather list, or a page list.                        */
+	UET_MSG_BUF_TYPE_MR,
+	       /* The data lives in a list of segments, each naming a range   */
+	       /* within its own memory region (MR), and is reached through   */
+	       /* scatter_flat_to_seg and gather_seg_to_flat. This is how a   */
+	       /* local buffer is described when it is backed by regions      */
+	       /* rather than by addresses.                                   */
+	UET_MSG_BUF_TYPE_SEG,
 } uet_msg_buf_type_t;
 
 /* descriptor for contiguous message buffer */
@@ -216,8 +261,12 @@ struct uet_msg_desc_contig {
 struct uet_msg_desc_iov {
 	size_t iov_count;                         /* number of entries in iov */
 	const struct iovec *iov;                         /* vector for buffer */
-					    /* array of dma addr's for buffer */
-	uet_dma_addr_t dma_addr[UET_IOV_LIMIT_MAX];
+};
+
+/* descriptor for a segment-list message buffer */
+struct uet_msg_desc_seg {
+	size_t seg_count;                               /* number of segments */
+	struct uet_mr_seg *seg;            /* owned copy of the caller's list */
 };
 
 /* message buffer descriptor */
@@ -229,6 +278,7 @@ struct uet_msg_buf_desc {
 	union {
 		struct uet_msg_desc_contig contig;
 		struct uet_msg_desc_iov iov;
+		struct uet_msg_desc_seg seg;
 	};
 };
 
@@ -247,6 +297,13 @@ struct uet_rx_desc {
 #define UET_RX_DESC_FLAG_DSEND		(1 << 6)       /* deferred descriptor */
 #define UET_RX_DESC_FLAG_CANCELLED	(1 << 7)
 #define UET_RX_DESC_FLAG_ERR_TRACK	(1 << 8)
+	   /* buf_desc.iov.iov was allocated for this descriptor and must be  */
+	   /* freed with it. When clear, the vector is borrowed from a memory */
+	   /* region descriptor, which owns it (prevents double free).        */
+#define UET_RX_DESC_FLAG_OWNS_IOV	(1 << 9)
+	   /* buf_desc.seg.seg was allocated for this descriptor and must be  */
+	   /* freed with it                                                   */
+#define UET_RX_DESC_FLAG_OWNS_SEG	(1 << 10)
 	int desc_flags;                          /* flags for this descriptor */
 	uet_ses_rc_t ses_rc;    /* ses return code, for marking errored msg's */
 	struct uet_msg_buf_desc buf_desc;                /* buffer descriptor */
@@ -350,6 +407,13 @@ struct uet_tx_desc {
 #define UET_TX_DESC_FLAG_ATOMIC_FETCH_REQ	(1 << 11)
 #define UET_TX_DESC_FLAG_ATOMIC_COMPARE_REQ	(1 << 12)
 #define UET_TX_DESC_FLAG_SYNC_REQ		(1 << 13)
+	   /* buf_desc.buf was allocated for this descriptor (a read response */
+	   /* gathered out of a scattered memory region) and must be freed    */
+	   /* when the descriptor is recycled.                                */
+#define UET_TX_DESC_FLAG_OWNS_BUF		(1 << 14)
+	   /* buf_desc.seg.seg was allocated for this descriptor and must be  */
+	   /* freed with it                                                   */
+#define UET_TX_DESC_FLAG_OWNS_SEG		(1 << 15)
 	int desc_flags;                          /* flags for this descriptor */
 	struct uet_msg_buf_desc buf_desc;                /* buffer descriptor */
 	uint64_t pkt_cnt;                /* number of pkt tx for this message */
@@ -652,6 +716,10 @@ struct uet_ack_d_info {
 	uint32_t payload_len;                        /* size of data in bytes */
 	uint32_t msg_off;                               /* msg offset of data */
 	void *buf;                                             /* ptr to data */
+	     /* Staging area used when the source memory region is described  */
+	     /* by a scatter/gather list, where no contiguous pointer into    */
+	     /* the region exists. buf points here once the data is gathered. */
+	uint8_t gather_buf[UET_DEFAULT_MAX_PAYLOAD_LEN];
 };
 
 #endif /* _UET_API_PRIVATE_H_ */

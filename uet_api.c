@@ -52,6 +52,30 @@
 #define UET_NO_REMOTE_MEM_ADDR    0
 #define UET_NO_REMOTE_KEY         0
 
+static size_t scatter_flat_to_iov(const struct iovec *iov, size_t iov_count,
+				  const void *payload, size_t payload_len,
+				  size_t payload_offset);
+static size_t gather_iov_to_flat(const struct iovec *iov, size_t iov_count,
+				 void *dst, size_t len, size_t offset);
+static inline bool uet_mr_is_scattered(const struct uet_mr_desc *mr_desc);
+static bool uet_mr_addr_to_offset(const struct uet_mr_desc *mr_desc,
+				  uint64_t addr, size_t len, size_t *offset);
+static size_t uet_seg_total_len(const struct uet_mr_seg *seg, size_t seg_count);
+static bool uet_seg_validate(const struct uet_mr_seg *seg, size_t seg_count);
+static size_t scatter_flat_to_seg(const struct uet_mr_seg *seg,
+				  size_t seg_count, const void *payload,
+				  size_t payload_len, size_t payload_offset);
+static size_t gather_seg_to_flat(const struct uet_mr_seg *seg,
+				 size_t seg_count, void *dst, size_t len,
+				 size_t offset);
+static size_t uet_mr_scatter(const struct uet_mr_desc *mr_desc, size_t offset,
+			     const void *src, size_t len);
+static size_t uet_mr_gather(const struct uet_mr_desc *mr_desc, size_t offset,
+			    void *dst, size_t len);
+static void *uet_mr_atomic_addr(const struct uet_mr_desc *mr_desc,
+				size_t offset, size_t len);
+static void *uet_rx_desc_cq_buf(const struct uet_rx_desc *rx_desc);
+
 /* receive api types */
 typedef enum {
 	UET_RECV_API,
@@ -1278,6 +1302,21 @@ static void uet_rx_desc_recycle(struct uet_rx_desc *rx_desc,
 /* insert entry into list of available tx descriptors for an endpoint */
 static void uet_tx_desc_list_insert(struct uet_tx_desc *tx_desc)
 {
+	/* release a read-response buffer gathered from a scattered memory
+	 * region before the flags that record its ownership are cleared
+	 */
+	if (tx_desc->desc_flags & UET_TX_DESC_FLAG_OWNS_BUF) {
+		free(tx_desc->buf_desc.buf);
+		tx_desc->buf_desc.buf = NULL;
+	}
+
+	/* likewise a segment list this descriptor copied for itself */
+	if (tx_desc->desc_flags & UET_TX_DESC_FLAG_OWNS_SEG) {
+		free(tx_desc->buf_desc.seg.seg);
+		tx_desc->buf_desc.seg.seg = NULL;
+		tx_desc->buf_desc.seg.seg_count = 0;
+	}
+
 	tx_desc->state = UET_TX_DESC_STATE_INACTIVE;
 	tx_desc->desc_flags = UET_TX_DESC_FLAG_NONE;
 	tx_desc->pkt_cnt = 0;
@@ -1385,9 +1424,18 @@ static void uet_desc_free(struct uet_ep *uet_ep)
 	if (uet_ep->rx_desc) {
 		for (i = 0; i < uet_ep->num_rx_desc; i++) {
 			rx_desc = &uet_ep->rx_desc[i];
-			iov = (struct iovec *)rx_desc->buf_desc.iov.iov;
-			if (iov)
-				free(iov);
+			/* Only release a vector this descriptor owns - an rma
+			 * descriptor borrows the vector from the target memory
+			 * region, which frees it with the domain.
+			 */
+			if (rx_desc->desc_flags & UET_RX_DESC_FLAG_OWNS_IOV) {
+				iov = (struct iovec *)rx_desc->buf_desc.iov.iov;
+				if (iov)
+					free(iov);
+			}
+
+			if (rx_desc->desc_flags & UET_RX_DESC_FLAG_OWNS_SEG)
+				free(rx_desc->buf_desc.seg.seg);
 		}
 		free(uet_ep->rx_desc);
 	}
@@ -1395,12 +1443,22 @@ static void uet_desc_free(struct uet_ep *uet_ep)
 	if (uet_ep->tx_desc) {
 		for (i = 0; i < uet_ep->num_tx_desc; i++) {
 			tx_desc = &uet_ep->tx_desc[i];
-			iov = (struct iovec *)(tx_desc->buf_desc.iov.iov);
-			if (iov)
-				free(iov);
+
+			if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
+				iov = (struct iovec *)
+					(tx_desc->buf_desc.iov.iov);
+				if (iov)
+					free(iov);
+			} else if (tx_desc->buf_desc.type ==
+				   UET_MSG_BUF_TYPE_SEG) {
+				free(tx_desc->buf_desc.seg.seg);
+			}
+
 			if (tx_desc->desc_flags &
-					UET_TX_DESC_FLAG_MSG_ID_ALLOCATED)
-				uet_dealloc_msg_id(uet_ep->uet_domain->uet, tx_desc->msg_id);
+			    UET_TX_DESC_FLAG_MSG_ID_ALLOCATED)
+				uet_dealloc_msg_id(uet_ep->uet_domain->uet,
+						   tx_desc->msg_id);
+
 			uet_dealloc_tx_rtr_token(tx_desc);
 			uet_tx_desc_buf_rtr_list_remove(tx_desc);
 		}
@@ -1813,7 +1871,7 @@ static void uet_rx_cq_post_entry(struct uet_rx_desc *rx_desc)
 		cq_entry->len = rx_desc->msg_len;
 	}
 	if (cq->format_size >= sizeof(struct fi_cq_msg_entry)) {
-		cq_entry->buf = rx_desc->buf_desc.buf;
+		cq_entry->buf = uet_rx_desc_cq_buf(rx_desc);
 		if (rx_desc->desc_flags & UET_RX_DESC_FLAG_WRITE_IMM) {
 			cq_entry->data = rx_desc->imm_data;
 			cq_entry->flags |= FI_REMOTE_CQ_DATA;
@@ -1895,10 +1953,34 @@ static void uet_rx_cq_post_err(struct uet_rx_desc *rx_desc, int err_code)
 		err_entry->data = rx_desc->imm_data;
 	if (rx_desc->cq_flags & FI_TAGGED)
 		err_entry->tag = ntohll(rx_desc->tag_key.tag);
-	err_entry->buf = rx_desc->buf_desc.buf;
+	err_entry->buf = uet_rx_desc_cq_buf(rx_desc);
 	uet_rx_desc_recycle(rx_desc, false);
 
 	uet_ring_head_advance(ring);
+}
+
+/*
+ * buffer address to report on a completion
+ *
+ * A scattered buffer has no single base address and leaves buf_desc.buf
+ * NULL, so report the first entry of the vector (the start of the region's
+ * flattened address space) rather than a NULL pointer.
+ */
+static void *uet_rx_desc_cq_buf(const struct uet_rx_desc *rx_desc)
+{
+	if ((rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) &&
+	    (rx_desc->buf_desc.iov.iov != NULL) &&
+	    (rx_desc->buf_desc.iov.iov_count > 0))
+		return rx_desc->buf_desc.iov.iov[0].iov_base;
+
+	if ((rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_MR) &&
+	    (rx_desc->mr_desc != NULL) &&
+	    (rx_desc->mr_desc->buf_desc.type == UET_MR_BUF_TYPE_IOV) &&
+	    (rx_desc->mr_desc->buf_desc.iov.iov != NULL) &&
+	    (rx_desc->mr_desc->buf_desc.iov.iov_count > 0))
+		return rx_desc->mr_desc->buf_desc.iov.iov[0].iov_base;
+
+	return rx_desc->buf_desc.buf;
 }
 
 /* free completion queue resources associated with an endpoint */
@@ -2014,13 +2096,19 @@ static void uet_domain_free(struct uet_domain *uet_dom)
 	if (uet_dom->mr_desc_alloc_cb.state)
 		free(uet_dom->mr_desc_alloc_cb.state);
 	if (uet_dom->mr_desc) {
+		/* Release the vector of every region that owns one. Only
+		 * UET_MR_BUF_TYPE_IOV keeps an allocation here.
+		 */
 		for (i = 0; i < uet_dom->num_mr; i++) {
-			if ((uet_dom->mr_desc[i].state !=
-			     UET_MR_DESC_STATE_INACTIVE) &&
-			    (uet_dom->mr_desc[i].buf_desc.type ==
-			     UET_MR_BUF_TYPE_IOV))
-				free((void *)uet_dom->mr_desc[i].buf_desc.iov.iov);
+			struct uet_mr_desc *mr_desc = &uet_dom->mr_desc[i];
+
+			if (mr_desc->buf_desc.type != UET_MR_BUF_TYPE_IOV)
+				continue;
+
+			free((struct iovec *) mr_desc->buf_desc.iov.iov);
+			mr_desc->buf_desc.iov.iov = NULL;
 		}
+
 		free(uet_dom->mr_desc);
 	}
 	free(uet_dom);
@@ -2292,13 +2380,8 @@ static uet_ses_rc_t uet_get_rx_desc(
 	/* more init of rx descriptor for rma operation */
 	if (mr_desc->buf_desc.type == UET_MR_BUF_TYPE_CONTIG)
 		(*rx_desc)->buf_desc.type = UET_MSG_BUF_TYPE_CONTIG;
-	else {
-		(*rx_desc)->buf_desc.type = UET_MSG_BUF_TYPE_IOV;
-		(*rx_desc)->buf_desc.iov.iov_count =
-			mr_desc->buf_desc.iov.iov_count;
-		(*rx_desc)->buf_desc.iov.iov =
-			mr_desc->buf_desc.iov.iov;;
-	}
+	else
+		(*rx_desc)->buf_desc.type = UET_MSG_BUF_TYPE_MR;
 
 	(*rx_desc)->buf_desc.buf = mr_desc->buf_desc.buf;
 	(*rx_desc)->buf_desc.len = mr_desc->buf_desc.len;
@@ -2386,8 +2469,36 @@ static uet_ses_rc_t uet_get_rd_tx_desc(
 	tx_desc->cq_flags = FI_RMA | FI_REMOTE_READ;
 	tx_desc->desc_flags = UET_TX_DESC_FLAG_READ_RSP;
 	tx_desc->buf_desc.type = UET_MSG_BUF_TYPE_CONTIG;
-	tx_desc->buf_desc.buf = (void *)
-		(((uint8_t *) mr_desc->buf_desc.buf) + buf_off);
+	if (uet_mr_is_scattered(mr_desc)) {
+		/* A scattered region offers no contiguous pointer to hand to
+		 * the transmit path, and this descriptor outlives the call,
+		 * so gather the requested range into a buffer owned by the
+		 * descriptor that is released when it is recycled.
+		 */
+		void *rd_buf = malloc(pp->ses_payload_len);
+		if (rd_buf == NULL) {
+			UET_API_PRINT_ERRNO("malloc");
+			uet_tx_desc_list_insert(tx_desc);
+			*ret_tx_desc = NULL;
+			return UET_RC_UNCOR_TRNSNT;
+		}
+
+		if (uet_mr_gather(mr_desc, buf_off, rd_buf,
+				  pp->ses_payload_len) !=
+		    pp->ses_payload_len) {
+			UET_API_ERR("RX: Read Req: Invalid Buffer Offset");
+			free(rd_buf);
+			uet_tx_desc_list_insert(tx_desc);
+			*ret_tx_desc = NULL;
+			return UET_RC_BAD_ADDR;
+		}
+
+		tx_desc->buf_desc.buf = rd_buf;
+		tx_desc->desc_flags |= UET_TX_DESC_FLAG_OWNS_BUF;
+	} else {
+		tx_desc->buf_desc.buf =
+			(void *)(((uint8_t *)mr_desc->buf_desc.buf) + buf_off);
+	}
 	tx_desc->buf_desc.len = pp->ses_payload_len;
 	tx_desc->remaining_bytes = pp->ses_payload_len;
 	tx_desc->remote_msg_off = msg_off;
@@ -2514,8 +2625,9 @@ static uet_ses_rc_t uet_rx_rd_req_pkt(
 		return UET_RC_OP_VIOLATION;
 	}
 
-	/* validate requested data is within memory region */
-	if ((buf_off + pp->ses_payload_len) > mr_desc->buf_desc.len) {
+	/* resolve the address against the region and validate the range */
+	if (!uet_mr_addr_to_offset(mr_desc, buf_off, pp->ses_payload_len,
+				   &buf_off)) {
 		UET_API_ERR("RX: Read Req: Invalid Buffer Offset");
 		return UET_RC_BAD_ADDR;
 	}
@@ -2528,7 +2640,34 @@ static uet_ses_rc_t uet_rx_rd_req_pkt(
 		ack_d_info->valid = true;
 		ack_d_info->payload_len = pp->ses_payload_len;
 		ack_d_info->msg_off = msg_off;
-		ack_d_info->buf = ((uint8_t *) mr_desc->buf_desc.buf) + buf_off;
+
+		if (uet_mr_is_scattered(mr_desc)) {
+			/* A scattered region offers no contiguous pointer, so
+			 * stage the data in the ack info struct. The staging
+			 * area is sized for a maximum payload. Refuse anything
+			 * larger rather than overrun it.
+			 */
+			if (pp->ses_payload_len >
+			    sizeof(ack_d_info->gather_buf)) {
+				UET_API_ERR("RX: Read Req: ack payload "
+					    "exceeds gather buf");
+				return UET_RC_BAD_ADDR;
+			}
+
+			if (uet_mr_gather(mr_desc, buf_off,
+					  ack_d_info->gather_buf,
+					  pp->ses_payload_len) !=
+			    pp->ses_payload_len) {
+				UET_API_ERR("RX: Read Req: Invalid Buffer "
+					    "Offset");
+				return UET_RC_BAD_ADDR;
+			}
+
+			ack_d_info->buf = ack_d_info->gather_buf;
+		} else {
+			ack_d_info->buf =
+				((uint8_t *)mr_desc->buf_desc.buf + buf_off);
+		}
 	} else {
 		/* get tx descriptor for sending read response */
 		ses_rc = uet_get_rd_tx_desc(uet_ep, pp, req_len, buf_off,
@@ -2721,17 +2860,32 @@ static uet_ses_rc_t uet_rx_atomic_req_pkt(
 		goto err_exit;
 	}
 
-	/* validate requested data is within memory region */
-	if ((start_off + UET_VERBS_ATOMIC_DATA_BYTES) >
-	     mr_desc->buf_desc.len) {
+	/* resolve the address against the region and validate the range */
+	if (!uet_mr_addr_to_offset(mr_desc, start_off,
+				   UET_VERBS_ATOMIC_DATA_BYTES, &start_off)) {
 		UET_API_ERR("RX: Atomic Req: Invalid Buffer Offset");
 		ses_rc = UET_RC_BAD_ADDR;
 		goto err_exit;
 	}
 
+	/* An atomic needs a single naturally aligned location that the
+	 * __atomic builtins can operate on in place. A scattered region has
+	 * no such designation and the operand could straddle two entries.
+	 * Verify that the address offset within the descriptor memory is
+	 * contiguous based on a specific atomic data length.
+	 */
+
 	/* implement atomic operation                                  */
 	/*   - atomic operation may be deferred by sync group protocol */
-	addr = (uint64_t *) (((uint8_t *) mr_desc->buf_desc.buf) + start_off);
+	addr = uet_mr_atomic_addr(mr_desc, start_off,
+				  UET_VERBS_ATOMIC_DATA_BYTES);
+	if (addr == NULL) {
+		UET_API_ERR("RX: Atomic Req: operand misaligned or "
+			    "spans a page boundary");
+		ses_rc = UET_RC_BAD_ADDR;
+		goto err_exit;
+	}
+
 	if (sync)
 		data = ntohll(*((uint64_t *) ses_sync->data));
 	else
@@ -2884,8 +3038,9 @@ static uet_ses_rc_t uet_rx_fetch_atomic_req_pkt(
 		return UET_RC_PERM_VIOLATION;
 	}
 
-	/* validate requested data is within memory region */
-	if ((start_off + UET_VERBS_ATOMIC_DATA_BYTES) > mr_desc->buf_desc.len) {
+	/* resolve the address against the region and validate the range */
+	if (!uet_mr_addr_to_offset(mr_desc, start_off,
+				   UET_VERBS_ATOMIC_DATA_BYTES, &start_off)) {
 		UET_API_ERR("RX: Fetching Atomic Req: Invalid Buffer Offset");
 		return UET_RC_BAD_ADDR;
 	}
@@ -2893,7 +3048,15 @@ static uet_ses_rc_t uet_rx_fetch_atomic_req_pkt(
 	/* implement atomic operation */
 	ack_d_info->payload_len = UET_VERBS_ATOMIC_DATA_BYTES;
 	ack_d_info->msg_off = 0;
-	addr = (uint64_t *) (((uint8_t *) mr_desc->buf_desc.buf) + start_off);
+
+	addr = uet_mr_atomic_addr(mr_desc, start_off,
+				  UET_VERBS_ATOMIC_DATA_BYTES);
+	if (addr == NULL) {
+		UET_API_ERR("RX: Fetching Atomic Req: operand misaligned or "
+			    "spans a page");
+		return UET_RC_BAD_ADDR;
+	}
+
 	if (opcode == UET_AMO_SUM) {
 		data = ntohll(*((uint64_t *) ses_atomic->data));
 		result = __atomic_fetch_add(addr, data, __ATOMIC_SEQ_CST);
@@ -2998,17 +3161,27 @@ static uet_ses_rc_t uet_rx_dsend(struct uet_ep *uet_ep,
 	return UET_RC_DEFER_SEND;
 }
 
-/*Assemble scatter list from buffer*/
-static void scatter_buffer_to_iov(
-	const struct iovec *iov, size_t iov_count, const void *payload,
-	size_t payload_len, size_t payload_offset)
+/*
+ * Assemble scatter list from a flat buffer. Scatters payload_len bytes of
+ * payload into the scatter/gather list, starting payload_offset bytes into
+ * the list's flattened address space.
+ *
+ * returns:
+ *   The number of bytes actually placed. This is less than payload_len only
+ *   when the scatter list is too short to hold the payload at that offset,
+ *   which MUST be treated as an error.
+ */
+static size_t scatter_flat_to_iov(const struct iovec *iov, size_t iov_count,
+				  const void *payload, size_t payload_len,
+				  size_t payload_offset)
 {
 	size_t iov_index = 0;
 	size_t remaining_bytes = payload_len;
 	size_t buf_offset = 0;
 	size_t iov_buf_offset = 0;
 
-	while (payload_offset > 0) {
+	/* walk forward to the entry containing payload_offset */
+	while ((payload_offset > 0) && (iov_index < iov_count)) {
 		if (iov[iov_index].iov_len <= payload_offset) {
 			payload_offset -= iov[iov_index].iov_len;
 			iov_index++;
@@ -3017,24 +3190,495 @@ static void scatter_buffer_to_iov(
 			break;
 		}
 	}
-	while (remaining_bytes > 0) {
-		if (iov[iov_index].iov_len - iov_buf_offset < remaining_bytes) {
 
-			memcpy(iov[iov_index].iov_base + iov_buf_offset,
-				payload + buf_offset,
-				iov[iov_index].iov_len - iov_buf_offset);
+	while ((remaining_bytes > 0) && (iov_index < iov_count)) {
+		size_t avail = (iov[iov_index].iov_len - iov_buf_offset);
 
-			remaining_bytes -= (iov[iov_index].iov_len -
-								iov_buf_offset);
-			buf_offset += (iov[iov_index].iov_len - iov_buf_offset);
+		if (avail < remaining_bytes) {
+			memcpy((iov[iov_index].iov_base + iov_buf_offset),
+			       (payload + buf_offset), avail);
+			remaining_bytes -= avail;
+			buf_offset += avail;
 			iov_index++;
 			iov_buf_offset = 0;
 		} else {
-			memcpy(iov[iov_index].iov_base + iov_buf_offset,
-				payload + buf_offset,
-				remaining_bytes);
-			remaining_bytes -= remaining_bytes;
+			memcpy((iov[iov_index].iov_base + iov_buf_offset),
+			       (payload + buf_offset), remaining_bytes);
+			buf_offset += remaining_bytes;
+			remaining_bytes = 0;
 		}
+	}
+
+	return buf_offset;
+}
+
+/*
+ * Gather from a scatter/gather list into a flat buffer. The mirror of
+ * scatter_flat_to_iov(). Copies len bytes out of the list, starting offset
+ * bytes into the list's flattened address space.
+ *
+ * returns:
+ *   The number of bytes actually gathered. This is less than len only when
+ *   the scatter list is too short to satisfy the request at that offset,
+ *   which MUST be treated as an error.
+ */
+static size_t gather_iov_to_flat(
+	const struct iovec *iov, size_t iov_count, void *dst,
+	size_t len, size_t offset)
+{
+	size_t iov_index = 0;
+	size_t remaining_bytes = len;
+	size_t dst_offset = 0;
+	size_t iov_buf_offset = 0;
+
+	/* walk forward to the entry containing offset */
+	while ((offset > 0) && (iov_index < iov_count)) {
+		if (iov[iov_index].iov_len <= offset) {
+			offset -= iov[iov_index].iov_len;
+			iov_index++;
+		} else {
+			iov_buf_offset = offset;
+			break;
+		}
+	}
+
+	while ((remaining_bytes > 0) && (iov_index < iov_count)) {
+		size_t avail = (iov[iov_index].iov_len - iov_buf_offset);
+		size_t to_copy = (avail < remaining_bytes) ?
+					avail : remaining_bytes;
+
+		memcpy(((uint8_t *)dst + dst_offset),
+		       ((uint8_t *)iov[iov_index].iov_base + iov_buf_offset),
+		       to_copy);
+
+		dst_offset += to_copy;
+		remaining_bytes -= to_copy;
+		iov_index++;
+		iov_buf_offset = 0;
+	}
+
+	return dst_offset;
+}
+
+/*
+ * Translate a dma address to something this process can dereference.
+ *
+ * FIXME: For future use with a device model does not own the memory its page
+ * lists describe and only the device model can resolve them...
+ */
+static void *uet_dma_to_host(const struct uet_instance *uet,
+			     uet_dma_addr_t addr, size_t len)
+{
+	(void)uet;
+	(void)len;
+
+	return (void *)(uintptr_t)addr;
+}
+
+/*
+ * resolve a byte offset within a PBL region to a host address
+ *
+ * Directory and page entries are read in place through the translation
+ * callback rather than being copied/stored in the descriptor.
+ *
+ * parms:
+ *   mr_desc - the region
+ *   offset  - byte offset into the region's flattened address space
+ *   run_len - set to the number of bytes contiguously accessible from the
+ *             returned address, never crossing a page boundary
+ *
+ * returns:
+ *   a dereferenceable pointer, or NULL if the offset cannot be resolved
+ */
+static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
+				size_t offset, size_t *run_len)
+{
+	const struct uet_mr_desc_pbl *pbl = &mr_desc->buf_desc.pbl;
+	const struct uet_instance *uet = mr_desc->uet_dom->uet;
+	size_t abs, page_idx, page_off, per_dir, dir_idx, ent_idx;
+	uet_dma_addr_t page_addr;
+	uet_dma_addr_t *dir;
+
+	abs = ((size_t)pbl->page_offset + offset);
+	page_idx = (abs >> pbl->page_shift);
+	page_off = (abs & ((size_t)pbl->page_size - 1));
+
+	switch (pbl->level) {
+	case UET_PBL_LEVEL_0:
+		*run_len = (mr_desc->buf_desc.len - offset);
+		return uet_dma_to_host(uet, (pbl->root + abs), *run_len);
+
+	case UET_PBL_LEVEL_1:
+		dir = uet_dma_to_host(uet, pbl->root,
+				      ((page_idx + 1) * sizeof(*dir)));
+		if (dir == NULL)
+			return NULL;
+
+		page_addr = dir[page_idx];
+		break;
+
+	case UET_PBL_LEVEL_2:
+		per_dir = (pbl->page_size / sizeof(uet_dma_addr_t));
+		dir_idx = (page_idx / per_dir);
+		ent_idx = (page_idx % per_dir);
+
+		dir = uet_dma_to_host(uet, pbl->root,
+				      ((dir_idx + 1) * sizeof(*dir)));
+		if (dir == NULL)
+			return NULL;
+
+		dir = uet_dma_to_host(uet, dir[dir_idx], pbl->page_size);
+		if (dir == NULL)
+			return NULL;
+
+		page_addr = dir[ent_idx];
+		break;
+
+	default:
+		return NULL;
+	}
+
+	*run_len = ((size_t)pbl->page_size - page_off);
+	return uet_dma_to_host(uet, (page_addr + page_off), *run_len);
+}
+
+/*
+ * copy into or out of a PBL region
+ *
+ * returns the number of bytes moved
+ */
+static size_t uet_mr_pbl_copy(const struct uet_mr_desc *mr_desc, size_t offset,
+			      void *flat, size_t len, bool into_mr)
+{
+	void *p;
+	size_t run;
+	size_t done = 0;
+
+	while (done < len) {
+		p = uet_mr_pbl_resolve(mr_desc, (offset + done), &run);
+		if (p == NULL)
+			break;
+
+		if (run > (len - done))
+			run = (len - done);
+
+		if (run == 0)
+			break;
+
+		if (into_mr)
+			memcpy(p, ((const uint8_t *)flat + done), run);
+		else
+			memcpy(((uint8_t *)flat + done), p, run);
+
+		done += run;
+	}
+
+	return done;
+}
+
+/*
+ * Convert an address naming a memory region into an offset into it.
+ *
+ * A region's base_va selects the convention: 0 means addresses naming it are
+ * offsets from zero, anything else means they are virtual addresses and the
+ * base is subtracted.
+ *
+ * parms:
+ *   mr_desc - the region
+ *   addr    - address naming the region, in its own convention
+ *   len     - number of bytes that must be within the region from there
+ *   offset  - set to the resulting offset on success
+ *
+ * returns:
+ *   true when the range lies wholly within the region
+ */
+static bool uet_mr_addr_to_offset(const struct uet_mr_desc *mr_desc,
+				  uint64_t addr, size_t len, size_t *offset)
+{
+	uint64_t off;
+
+	if (addr < mr_desc->base_va)
+		return false;
+
+	off = (addr - mr_desc->base_va);
+
+	if ((off > mr_desc->buf_desc.len) ||
+	    (len > (mr_desc->buf_desc.len - off)))
+		return false;
+
+	*offset = (size_t)off;
+	return true;
+}
+
+/*
+ * Total length of a segment list.
+ */
+static size_t uet_seg_total_len(const struct uet_mr_seg *seg,
+				size_t seg_count)
+{
+	size_t i, total = 0;
+
+	for (i = 0; i < seg_count; i++)
+		total += seg[i].len;
+
+	return total;
+}
+
+/*
+ * Check that every segment names an enabled region and lies wholly within it.
+ */
+static bool uet_seg_validate(const struct uet_mr_seg *seg, size_t seg_count)
+{
+	size_t i, offset;
+
+	if ((seg == NULL) || (seg_count == 0))
+		return false;
+
+	for (i = 0; i < seg_count; i++) {
+		const struct uet_mr_desc *mr_desc =
+			(const struct uet_mr_desc *)seg[i].mr;
+
+		if (mr_desc == NULL)
+			return false;
+
+		if (mr_desc->state != UET_MR_DESC_STATE_ENABLED)
+			return false;
+
+		if (!uet_mr_addr_to_offset(mr_desc, seg[i].addr, seg[i].len,
+					   &offset))
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Move bytes between a flat buffer and a segment list.
+ *
+ * The list's flattened address space are the segments end to end, so an
+ * offset locates a segment and a position within it. Each segment then
+ * resolves through its own region, which is where any knowledge of
+ * contiguous buffers, vectors, and page lists lives.
+ *
+ * returns:
+ *   The number of bytes moved, less than len only when the list cannot
+ *   satisfy the request, which callers MUST treat as an error.
+ */
+static size_t uet_seg_copy(const struct uet_mr_seg *seg, size_t seg_count,
+			   void *flat, size_t len, size_t offset, bool to_seg)
+{
+	size_t i, within = offset, done = 0;
+
+	/* locate the segment holding offset */
+	for (i = 0; i < seg_count; i++) {
+		if (within < seg[i].len)
+			break;
+		within -= seg[i].len;
+	}
+
+	for (; (i < seg_count) && (done < len); i++) {
+		const struct uet_mr_desc *mr_desc =
+			(const struct uet_mr_desc *)seg[i].mr;
+		size_t avail = (seg[i].len - within);
+		size_t run = (avail < (len - done)) ? avail : (len - done);
+		size_t mr_off, moved;
+
+		if (mr_desc == NULL)
+			break;
+
+		/* the segment's address is in its own region's convention */
+		if (!uet_mr_addr_to_offset(mr_desc, (seg[i].addr + within), run,
+					   &mr_off))
+			break;
+
+		if (to_seg)
+			moved = uet_mr_scatter(mr_desc, mr_off,
+					       ((const uint8_t *)flat + done),
+					       run);
+		else
+			moved = uet_mr_gather(mr_desc, mr_off,
+					      ((uint8_t *)flat + done), run);
+
+		if (moved != run)
+			break;
+
+		done += run;
+		within = 0;
+	}
+
+	return done;
+}
+
+/*
+ * Scatter a flat payload into a segment list. The mirror of
+ * scatter_flat_to_iov() one level up.
+ */
+static size_t scatter_flat_to_seg(const struct uet_mr_seg *seg,
+				  size_t seg_count, const void *payload,
+				  size_t payload_len, size_t payload_offset)
+{
+	return uet_seg_copy(seg, seg_count, (void *)payload, payload_len,
+			    payload_offset, true);
+}
+
+/*
+ * Gather from a segment list into a flat buffer. The mirror of
+ * gather_iov_to_flat() one level up.
+ */
+static size_t gather_seg_to_flat(const struct uet_mr_seg *seg,
+				 size_t seg_count, void *dst, size_t len,
+				 size_t offset)
+{
+	return uet_seg_copy(seg, seg_count, dst, len, offset, false);
+}
+
+/*
+ * True when a memory region has no single base address spanning its whole
+ * length, so buf_desc.buf must not be used for address arithmetic. Such a
+ * region can only be reached through uet_mr_scatter()/uet_mr_gather().
+ */
+static inline bool uet_mr_is_scattered(const struct uet_mr_desc *mr_desc)
+{
+	return (mr_desc->buf_desc.type != UET_MR_BUF_TYPE_CONTIG);
+}
+
+/*
+ * resolve an atomic operand to a location that can be updated in place
+ *
+ * An atomic must act on a single naturally aligned location: the __atomic
+ * builtins need a real address, and an operand split across two pages or
+ * two vector entries cannot be made atomic at all.
+ *
+ * Natural alignment is what makes this workable on a scattered region: an
+ * aligned operand can never straddle a power-of-two page boundary, so an
+ * aligned offset resolves to exactly one page.
+ *
+ * parms:
+ *   mr_desc - the region
+ *   offset  - byte offset into the region's flattened address space
+ *   len     - operand size in bytes, which must be a power of 2
+ *
+ * returns:
+ *   The address of the operand, or NULL when it is not addressable that
+ *   way (out of bounds, spanning a boundary, or not naturally aligned)
+ */
+static void *uet_mr_atomic_addr(const struct uet_mr_desc *mr_desc,
+				size_t offset, size_t len)
+{
+	void *p = NULL;
+	size_t run = 0;
+
+	if ((offset > mr_desc->buf_desc.len) ||
+	    (len > (mr_desc->buf_desc.len - offset)))
+		return NULL;
+
+	switch (mr_desc->buf_desc.type) {
+	case UET_MR_BUF_TYPE_CONTIG:
+		p = ((uint8_t *)mr_desc->buf_desc.buf + offset);
+		run = (mr_desc->buf_desc.len - offset);
+		break;
+
+	case UET_MR_BUF_TYPE_IOV: {
+		const struct iovec *iov = mr_desc->buf_desc.iov.iov;
+		size_t count = mr_desc->buf_desc.iov.iov_count;
+		size_t i, rem = offset;
+
+		for (i = 0; i < count; i++) {
+			if (rem < iov[i].iov_len)
+				break;
+
+			rem -= iov[i].iov_len;
+		}
+
+		if (i == count)
+			return NULL;
+
+		p = ((uint8_t *)iov[i].iov_base + rem);
+		run = (iov[i].iov_len - rem);
+		break;
+	}
+
+	case UET_MR_BUF_TYPE_PBL:
+		p = uet_mr_pbl_resolve(mr_desc, offset, &run);
+		break;
+
+	default:
+		return NULL;
+	}
+
+	/* the operand must lie wholly within one addressable run */
+	if ((p == NULL) || (run < len))
+		return NULL;
+
+	/* and be naturally aligned; len is a power of 2 */
+	if (((uintptr_t)p & (len - 1)) != 0)
+		return NULL;
+
+	return p;
+}
+
+/*
+ * Copy into a memory region at a byte offset into its flattened address
+ * space, whatever representation the region uses.
+ *
+ * returns:
+ *   The number of bytes written, which is less than len only when the
+ *   region cannot hold len bytes at that offset. Callers MUST treat a
+ *   short result as an error.
+ */
+static size_t uet_mr_scatter(const struct uet_mr_desc *mr_desc, size_t offset,
+			     const void *src, size_t len)
+{
+	if ((offset > mr_desc->buf_desc.len) ||
+	    (len > (mr_desc->buf_desc.len - offset)))
+		return 0;
+
+	switch (mr_desc->buf_desc.type) {
+	case UET_MR_BUF_TYPE_CONTIG:
+		memcpy(((uint8_t *)mr_desc->buf_desc.buf + offset), src, len);
+		return len;
+
+	case UET_MR_BUF_TYPE_IOV:
+		return scatter_flat_to_iov(mr_desc->buf_desc.iov.iov,
+					   mr_desc->buf_desc.iov.iov_count,
+					   src, len, offset);
+
+	case UET_MR_BUF_TYPE_PBL:
+		return uet_mr_pbl_copy(mr_desc, offset, (void *)src, len,
+				       true);
+
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Copy out of a memory region at a byte offset into its flattened address
+ * space. The mirror of uet_mr_scatter() and the same short-result contract
+ * applies.
+ */
+static size_t uet_mr_gather(const struct uet_mr_desc *mr_desc, size_t offset,
+			    void *dst, size_t len)
+{
+	if ((offset > mr_desc->buf_desc.len) ||
+	    (len > (mr_desc->buf_desc.len - offset)))
+		return 0;
+
+	switch (mr_desc->buf_desc.type) {
+	case UET_MR_BUF_TYPE_CONTIG:
+		memcpy(dst, ((uint8_t *)mr_desc->buf_desc.buf + offset), len);
+		return len;
+
+	case UET_MR_BUF_TYPE_IOV:
+		return gather_iov_to_flat(mr_desc->buf_desc.iov.iov,
+					  mr_desc->buf_desc.iov.iov_count,
+					  dst, len, offset);
+
+	case UET_MR_BUF_TYPE_PBL:
+		return uet_mr_pbl_copy(mr_desc, offset, dst, len, false);
+
+	default:
+		return 0;
 	}
 }
 
@@ -3125,13 +3769,18 @@ static uet_ses_rc_t uet_rx_req_pkt(
 			return UET_RC_OP_VIOLATION;
 		}
 
-		if ((buf_off + pp->ses_payload_len) > mr_desc->buf_desc.len) {
+		if (!uet_mr_addr_to_offset(mr_desc, buf_off,
+					   pp->ses_payload_len, &buf_off)) {
 			UET_API_ERR("RX: RUDI Write: Invalid Buffer Offset");
 			return UET_RC_BAD_ADDR;
 		}
 
-		buf_ptr = (void *)(((size_t) mr_desc->buf_desc.buf) + buf_off);
-		memcpy(buf_ptr, pp->payload, pp->ses_payload_len);
+		if (uet_mr_scatter(mr_desc, buf_off, pp->payload,
+				   pp->ses_payload_len) !=
+		    pp->ses_payload_len) {
+			UET_API_ERR("RX: RUDI Write: Invalid Buffer Offset");
+			return UET_RC_BAD_ADDR;
+		}
 
 		return UET_RC_OK; /* caller will emit one RUDI response */
 	}
@@ -3389,12 +4038,32 @@ static uet_ses_rc_t uet_rx_req_pkt(
 				       UET_RC_INITIATOR_ERR));
 	}
 
-	if (rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
-		scatter_buffer_to_iov(
-				rx_desc->buf_desc.iov.iov,
-				rx_desc->buf_desc.iov.iov_count,
-				pp->payload, pp->pkt_payload_len,
-				buf_off);
+	if (rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_MR) {
+		if (uet_mr_scatter(rx_desc->mr_desc, buf_off, pp->payload,
+				   pp->pkt_payload_len) !=
+		    pp->pkt_payload_len) {
+			UET_API_ERR("RX: Invalid Buffer Offset");
+			return (uet_rx_msg_err(uet_ep, pp, rx_desc,
+					       UET_RC_BAD_ADDR));
+		}
+	} else if (rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) {
+		if (scatter_flat_to_seg(rx_desc->buf_desc.seg.seg,
+					rx_desc->buf_desc.seg.seg_count,
+					pp->payload, pp->pkt_payload_len,
+					buf_off) != pp->pkt_payload_len) {
+			UET_API_ERR("RX: Payload Exceeds Segment List");
+			return (uet_rx_msg_err(uet_ep, pp, rx_desc,
+					       UET_RC_BAD_ADDR));
+		}
+	} else if (rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
+		if (scatter_flat_to_iov(rx_desc->buf_desc.iov.iov,
+					rx_desc->buf_desc.iov.iov_count,
+					pp->payload, pp->pkt_payload_len,
+					buf_off) != pp->pkt_payload_len) {
+			UET_API_ERR("RX: Payload Exceeds Scatter List");
+			return (uet_rx_msg_err(uet_ep, pp, rx_desc,
+					       UET_RC_BAD_ADDR));
+		}
 	} else {
 		buf_ptr =  (void *) (((size_t) rx_desc->buf_desc.buf) +
 				     buf_off);
@@ -3567,14 +4236,40 @@ static uet_ses_rc_t uet_rx_read_data(
 	/* scatter the read response into the local buffer (which may be a
 	 * multi-segment scatter/gather list)
 	 */
-	if (rx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
-		scatter_buffer_to_iov(rx_desc->buf_desc.iov.iov,
-				      rx_desc->buf_desc.iov.iov_count,
-				      ses->payload, pp->ses_payload_len,
-				      msg_off);
-	} else {
+	switch (rx_desc->buf_desc.type) {
+	case UET_MSG_BUF_TYPE_SEG:
+		if (scatter_flat_to_seg(rx_desc->buf_desc.seg.seg,
+					rx_desc->buf_desc.seg.seg_count,
+					ses->payload, pp->ses_payload_len,
+					msg_off) != pp->ses_payload_len) {
+			UET_API_ERR("Read Rsp: Payload Exceeds Segment List");
+			return UET_RC_BAD_ADDR;
+		}
+		break;
+
+	case UET_MSG_BUF_TYPE_IOV:
+		if (scatter_flat_to_iov(rx_desc->buf_desc.iov.iov,
+					rx_desc->buf_desc.iov.iov_count,
+					ses->payload, pp->ses_payload_len,
+					msg_off) != pp->ses_payload_len) {
+			UET_API_ERR("Read Rsp: Payload Exceeds Scatter List");
+			return UET_RC_BAD_ADDR;
+		}
+		break;
+
+	case UET_MSG_BUF_TYPE_CONTIG:
 		buf_ptr = (void *) (((size_t) rx_desc->buf_desc.buf) + msg_off);
 		memcpy(buf_ptr, ses->payload, pp->ses_payload_len);
+		break;
+
+	default:
+		/* A read response lands in the initiator's own buffer. Any
+		 * other description of it is a bug rather than something to
+		 * fall through into a raw pointer dereference.
+		 */
+		UET_API_ERR("Read Rsp: unexpected buffer type %d",
+			    rx_desc->buf_desc.type);
+		return UET_RC_BAD_ADDR;
 	}
 
 	return UET_RC_OK;
@@ -4779,7 +5474,32 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 				flags |= UET_PDS_FLAG_MAINTAIN_PDC;
 		}
 
-		if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
+		if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) {
+			/* The segment walk is positioned by absolute offset
+			 * rather than by a saved offset, so it needs how far
+			 * into the message this packet starts. buf_off is
+			 * that, and is what the iov path uses too - it is
+			 * advanced and reset alongside remaining_bytes.
+			 */
+			pkt_buf = calloc(payload_len, sizeof(char));
+			if (pkt_buf &&
+			    (gather_seg_to_flat(tx_desc->buf_desc.seg.seg,
+						tx_desc->buf_desc.seg.seg_count,
+						pkt_buf, payload_len,
+						tx_desc->buf_desc.buf_off) !=
+			     payload_len)) {
+				free(pkt_buf);
+				pkt_buf = NULL;
+			}
+
+			if (!pkt_buf) {
+				UET_API_ERR("TX: Failed to gather segments");
+				rc = -FI_ENOMEM;
+				uet_tx_desc_set_err(tx_desc, -rc,
+					UET_TX_DESC_STATE_ERR_COMPLETE);
+				goto exit;
+			}
+		} else if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
 			pkt_buf = gather_iov_to_buffer(
 					tx_desc->buf_desc.iov.iov,
 					tx_desc->buf_desc.iov.iov_count,
@@ -4808,7 +5528,13 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 					  flags, pds_info, tx_desc->msg_id,
 					  next_hdr, ses, ses_len,
 					  pkt_buf, pkt_len, false);
-		if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV)
+
+		/* The iov and segment paths each build the packet payload in
+		 * a buffer of their own; the contiguous path points straight
+		 * into the caller's buffer and must not be freed.
+		 */
+		if ((tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) ||
+		    (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG))
 			free(pkt_buf);
 
 		if (rc == FI_SUCCESS) {
@@ -5089,19 +5815,20 @@ static ssize_t uet_recv_api_common(
 	uet_recv_api_t recv_api, uet_ep_handle_t ep_handle, uint32_t job_id,
 	const struct iovec *iov, size_t iov_count, uet_mr_handle_t mr_handle,
 	uet_addr_handle_t src_addr_handle, uint64_t tag, uint64_t ignore,
-	void *context)
+	void *context, const struct uet_mr_seg *seg, size_t seg_count)
 #else
 static ssize_t uet_recv_api_common(
 	uet_recv_api_t recv_api, uet_ep_handle_t ep_handle, uint32_t job_id,
 	const struct iovec *iov, size_t iov_count, uet_mr_handle_t mr_handle,
 	uet_addr_handle_t src_addr_handle, uint64_t tag, uint64_t ignore,
-	void *context)
+	void *context, const struct uet_mr_seg *seg, size_t seg_count)
 #endif
 {
 	struct uet_ep *uet_ep;
 	struct uet_rx_desc *rx_desc;
 	struct uet_av_entry *av_entry;
 	struct iovec *iov_handle;
+	struct uet_mr_seg *seg_handle = NULL;
 	size_t msg_len = 0;
 	size_t i;
 
@@ -5122,16 +5849,43 @@ static ssize_t uet_recv_api_common(
 		}
 	}
 
-	/* allocate iov and init */
-	iov_handle = calloc(iov_count, sizeof(struct iovec));
-	if (iov_handle == NULL) {
-		UET_API_ERR("Allocation of iov memory failed");
-		return -FI_ENOMEM;
+	/* A segment list describes the buffer with memory regions rather
+	 * than with addresses in this process. Validate it once here so a
+	 * malformed list is rejected at the call rather than partway
+	 * through a transfer, then keep a copy so the caller's array need
+	 * not outlive the operation.
+	 */
+	if (seg != NULL) {
+		if (!uet_seg_validate(seg, seg_count)) {
+			UET_API_ERR("Invalid segment list");
+			return -FI_EINVAL;
+		}
+
+		msg_len = uet_seg_total_len(seg, seg_count);
+
+		seg_handle = calloc(seg_count, sizeof(struct uet_mr_seg));
+		if (seg_handle == NULL) {
+			UET_API_ERR("Allocation of segment list failed");
+			return -FI_ENOMEM;
+		}
+
+		memcpy(seg_handle, seg,
+		       (seg_count * sizeof(struct uet_mr_seg)));
 	}
 
-	for (i = 0; i < iov_count; i++) {
-		msg_len += iov[i].iov_len;
-		iov_handle[i] = iov[i];
+	/* allocate iov and init */
+	iov_handle = NULL;
+	if (seg == NULL) {
+		iov_handle = calloc(iov_count, sizeof(struct iovec));
+		if (iov_handle == NULL) {
+			UET_API_ERR("Allocation of iov memory failed");
+			return -FI_ENOMEM;
+		}
+
+		for (i = 0; i < iov_count; i++) {
+			msg_len += iov[i].iov_len;
+			iov_handle[i] = iov[i];
+		}
 	}
 
 	pthread_mutex_lock(&uet_ep->data_lock);
@@ -5141,19 +5895,26 @@ static ssize_t uet_recv_api_common(
 	if (rx_desc == NULL) {
 		pthread_mutex_unlock(&uet_ep->data_lock);
 		free(iov_handle);
+		free(seg_handle);
 		return -FI_EAGAIN;
 	}
 
 	/* init msg descriptor */
 	memset(rx_desc, 0, sizeof(struct uet_rx_desc));
 	rx_desc->desc_flags = UET_RX_DESC_FLAG_POST_CQ;
-	if (iov_count == 1) {
+	if (seg_handle != NULL) {
+		rx_desc->buf_desc.type = UET_MSG_BUF_TYPE_SEG;
+		rx_desc->buf_desc.seg.seg = seg_handle;
+		rx_desc->buf_desc.seg.seg_count = seg_count;
+		rx_desc->desc_flags |= UET_RX_DESC_FLAG_OWNS_SEG;
+	} else if (iov_count == 1) {
 		rx_desc->buf_desc.type = UET_MSG_BUF_TYPE_CONTIG;
 		rx_desc->buf_desc.buf = iov->iov_base;
 	} else {
 		rx_desc->buf_desc.type = UET_MSG_BUF_TYPE_IOV;
 		rx_desc->buf_desc.iov.iov = iov_handle;
 		rx_desc->buf_desc.iov.iov_count = iov_count;
+		rx_desc->desc_flags |= UET_RX_DESC_FLAG_OWNS_IOV;
 	}
 	rx_desc->buf_desc.len = msg_len;
 	rx_desc->context = context;
@@ -5221,18 +5982,18 @@ static ssize_t uet_recv_api_common(
 static ssize_t uet_send_req_api_common(
 	uet_send_req_api_t send_req_api, uet_ep_handle_t ep_handle,
 	uint32_t job_id, const struct iovec *iov, size_t iov_count,
-	uet_mr_handle_t mr_handle,
-	uet_addr_handle_t dst_addr_handle, uint64_t tag, uint64_t *imm_data,
-	uint64_t remote_mem_addr, uint64_t remote_key,
-	struct uet_atomic_parms *parms, void *context)
+	uet_mr_handle_t mr_handle, uet_addr_handle_t dst_addr_handle,
+	uint64_t tag, uint64_t *imm_data, uint64_t remote_mem_addr,
+	uint64_t remote_key, struct uet_atomic_parms *parms, void *context,
+	const struct uet_mr_seg *seg, size_t seg_count)
 #else
 static ssize_t uet_send_req_api_common(
 	uet_send_req_api_t send_req_api, uet_ep_handle_t ep_handle,
 	uint32_t job_id, const struct iovec *iov, size_t iov_count,
-	uet_mr_handle_t mr_handle,
-	uet_addr_handle_t dst_addr_handle, uint64_t tag, uint64_t *imm_data,
-	uint64_t remote_mem_addr, uint64_t remote_key,
-	struct uet_atomic_parms *parms, void *context, uint16_t resource_index)
+	uet_mr_handle_t mr_handle, uet_addr_handle_t dst_addr_handle,
+	uint64_t tag, uint64_t *imm_data, uint64_t remote_mem_addr,
+	uint64_t remote_key, struct uet_atomic_parms *parms, void *context,
+	uint16_t resource_index, const struct uet_mr_seg *seg, size_t seg_count)
 #endif /* ENABLE_VERBS */
 {
 	int rc;
@@ -5247,6 +6008,7 @@ static ssize_t uet_send_req_api_common(
 	struct uet_av_entry *av_entry;
 	struct uet_sync_grp_av_entry *sync_grp_av_entry;
 	struct iovec *iov_handle;
+	struct uet_mr_seg *seg_handle = NULL;
 
 	uet_ep = (struct uet_ep *) ep_handle;
 	uet = uet_ep->uet_domain->uet;
@@ -5267,22 +6029,56 @@ static ssize_t uet_send_req_api_common(
 		av_entry->flags |= UET_NH_MAC_ADDR_V;
 	}
 
-	/* allocate iov and init */
-	iov_handle = calloc(iov_count, sizeof(struct iovec));
-	if (iov_handle == NULL) {
-		UET_API_ERR("Allocation of iov memory failed");
-		return -FI_ENOMEM;
+	/* A segment list describes the buffer with memory regions rather
+	 * than with addresses in this process. Validate it once here so a
+	 * malformed list is rejected at the call rather than partway
+	 * through a transfer.
+	 */
+	if (seg != NULL) {
+		if (!uet_seg_validate(seg, seg_count)) {
+			UET_API_ERR("Invalid segment list");
+			return -FI_EINVAL;
+		}
+
+		msg_len = uet_seg_total_len(seg, seg_count);
+
+		seg_handle = calloc(seg_count, sizeof(struct uet_mr_seg));
+		if (seg_handle == NULL) {
+			UET_API_ERR("Allocation of segment list failed");
+			return -FI_ENOMEM;
+		}
+
+		memcpy(seg_handle, seg,
+		       (seg_count * sizeof(struct uet_mr_seg)));
 	}
 
-	for (i = 0; i < iov_count; i++) {
-		msg_len += iov[i].iov_len;
-		iov_handle[i] = iov[i];
+	/* Total the length, and keep a private copy of the vector only when
+	 * a descriptor will actually reference it. A single-entry buffer is
+	 * recorded as contiguous and keeps no vector, and a segment list
+	 * keeps no vector at all.
+	 */
+	iov_handle = NULL;
+	if (seg == NULL) {
+		for (i = 0; i < iov_count; i++)
+			msg_len += iov[i].iov_len;
+
+		if (iov_count > 1) {
+			iov_handle = calloc(iov_count, sizeof(struct iovec));
+			if (iov_handle == NULL) {
+				UET_API_ERR("Allocation of iov memory failed");
+				return -FI_ENOMEM;
+			}
+
+			for (i = 0; i < iov_count; i++)
+				iov_handle[i] = iov[i];
+		}
 	}
 
 	/* allocate msg id */
 	rc = uet_alloc_msg_id(uet, &msg_id);
 	if (rc != FI_SUCCESS) {
 		free(iov_handle);
+		free(seg_handle);
 		return rc;
 	}
 
@@ -5295,6 +6091,7 @@ static ssize_t uet_send_req_api_common(
 		if (rc != FI_SUCCESS) {
 			uet_dealloc_msg_id(uet, msg_id);
 			free(iov_handle);
+			free(seg_handle);
 			return rc;
 		}
 		break;
@@ -5310,6 +6107,7 @@ static ssize_t uet_send_req_api_common(
 	if (tx_desc == NULL) {
 		pthread_mutex_unlock(&uet_ep->data_lock);
 		free(iov_handle);
+		free(seg_handle);
 		uet_dealloc_msg_id(uet, msg_id);
 		if (sync_grp_av_entry)
 			uet_sync_grp_free_initiator(uet_ep,
@@ -5342,6 +6140,7 @@ static ssize_t uet_send_req_api_common(
 			uet_tx_desc_list_insert(tx_desc);
 			pthread_mutex_unlock(&uet_ep->data_lock);
 			free(iov_handle);
+			free(seg_handle);
 			uet_dealloc_msg_id(uet, msg_id);
 			if (sync_grp_av_entry)
 				uet_sync_grp_free_initiator(
@@ -5354,7 +6153,30 @@ static ssize_t uet_send_req_api_common(
 		memset(rx_desc, 0, sizeof(struct uet_rx_desc));
 		rx_desc->desc_flags =
 			UET_RX_DESC_FLAG_POST_CQ | UET_RX_DESC_FLAG_READ_RSP;
-		if (iov_count == 1) {
+		if (seg_handle != NULL) {
+			/* The read response lands here while the request's
+			 * transmit descriptor is recycled independently, so
+			 * this descriptor gets its own copy of the list
+			 * rather than sharing one with two owners.
+			 */
+			struct uet_mr_seg *rx_seg =
+				calloc(seg_count, sizeof(struct uet_mr_seg));
+
+			if (rx_seg == NULL) {
+				pthread_mutex_unlock(&uet_ep->data_lock);
+				free(iov_handle);
+				free(seg_handle);
+				return -FI_ENOMEM;
+			}
+
+			memcpy(rx_seg, seg_handle,
+			       (seg_count * sizeof(struct uet_mr_seg)));
+
+			rx_desc->buf_desc.type = UET_MSG_BUF_TYPE_SEG;
+			rx_desc->buf_desc.seg.seg = rx_seg;
+			rx_desc->buf_desc.seg.seg_count = seg_count;
+			rx_desc->desc_flags |= UET_RX_DESC_FLAG_OWNS_SEG;
+		} else if (iov_count == 1) {
 			rx_desc->buf_desc.type = UET_MSG_BUF_TYPE_CONTIG;
 			rx_desc->buf_desc.buf = iov->iov_base;
 		} else {
@@ -5378,7 +6200,12 @@ static ssize_t uet_send_req_api_common(
 	memset(tx_desc, 0, sizeof(struct uet_tx_desc));
 	tx_desc->desc_flags = UET_TX_DESC_FLAG_MSG_ID_ALLOCATED |
 			      UET_TX_DESC_FLAG_POST_CQ;
-	if (iov_count == 1) {
+	if (seg_handle != NULL) {
+		tx_desc->buf_desc.type = UET_MSG_BUF_TYPE_SEG;
+		tx_desc->buf_desc.seg.seg = seg_handle;
+		tx_desc->buf_desc.seg.seg_count = seg_count;
+		tx_desc->desc_flags |= UET_TX_DESC_FLAG_OWNS_SEG;
+	} else if (iov_count == 1) {
 		tx_desc->buf_desc.type = UET_MSG_BUF_TYPE_CONTIG;
 		tx_desc->buf_desc.buf = iov->iov_base;
 	} else {
@@ -5514,8 +6341,6 @@ void uet_verbs_fi_freeinfo(struct fi_info *info)
 				free(info->nic->device_attr);
 			if (info->nic->link_attr)
 				free(info->nic->link_attr);
-			if (info->nic->fid.ops)
-				free(info->nic->fid.ops);
 			free(info->nic);
 		}
 		free(info);
@@ -5568,7 +6393,6 @@ struct fi_info *uet_verbs_fi_dupinfo(struct fi_info *info)
 	struct fid_nic *nic = NULL;
 	struct fi_device_attr *device_attr;
 	struct fi_link_attr *link_attr;
-	struct fi_ops *ops;
 
 	dup = calloc(1, sizeof(struct fi_info));
 	if (dup == NULL)
@@ -5646,15 +6470,6 @@ struct fi_info *uet_verbs_fi_dupinfo(struct fi_info *info)
 			*link_attr = *info->nic->link_attr;
 			info->nic->link_attr = link_attr;
 		}
-
-		if (nic->fid.ops) {
-			ops = calloc(1, sizeof(struct fi_ops));
-			if (ops == NULL)
-				goto err;
-
-			*ops = *info->nic->fid.ops;
-			info->nic->fid.ops = ops;
-		}
 	}
 
 	return dup;
@@ -5676,8 +6491,6 @@ err:
 				free(device_attr);
 			if (link_attr)
 				free(link_attr);
-			if (ops)
-				free(ops);
 			free(nic);
 		}
 		free(dup);
@@ -6489,22 +7302,22 @@ uint32_t uet_cq_read_src_id(uet_cq_handle_t cq_handle)
 	return cq->last_src_id;
 }
 
-ssize_t uet_cq_read(uet_cq_handle_t cq_handle, void *buf, size_t count)
+/*
+ * run one progress cycle for an endpoint
+ *
+ * Ages idle receive messages and receive sync groups, drives one receive
+ * packet through the PDS, drives pending transmits, and retries deferred
+ * transmit messages.
+ *
+ * NOTE: the caller MUST hold uet_ep->data_lock
+ */
+static void uet_ep_progress_locked(struct uet_ep *uet_ep)
 {
 	int rc;
 	uet_pkt_handle_t err_pkt_handle;
-	struct uet_cq *cq;
-	struct uet_ep *uet_ep;
 	struct uet_pds *pds;
-	struct uet_ring *ring;
-	ssize_t cq_count, rd_count, max_rd_count;
-	char *buffer = buf;
 
-	cq = (struct uet_cq *) cq_handle;
-	uet_ep = cq->uet_ep;
 	pds = &uet_ep->uet_domain->uet->pds;
-
-	pthread_mutex_lock(&uet_ep->data_lock);
 
 	uet_msg_age(uet_ep);
 	uet_rx_sync_grp_age(uet_ep);
@@ -6523,6 +7336,62 @@ ssize_t uet_cq_read(uet_cq_handle_t cq_handle, void *buf, size_t count)
 	}
 
 	uet_tx_msg_try(uet_ep);
+}
+
+int uet_ep_progress(uet_ep_handle_t ep_handle)
+{
+	struct uet_ep *uet_ep = (struct uet_ep *) ep_handle;
+
+	if (uet_ep == NULL)
+		return -FI_EINVAL;
+
+	pthread_mutex_lock(&uet_ep->data_lock);
+	uet_ep_progress_locked(uet_ep);
+	pthread_mutex_unlock(&uet_ep->data_lock);
+
+	return FI_SUCCESS;
+}
+
+int uet_progress(uet_domain_handle_t domain_handle)
+{
+	struct uet_domain *uet_dom = (struct uet_domain *) domain_handle;
+	struct uet_ep *uet_ep;
+	struct dlist_entry *head, *item;
+
+	if (uet_dom == NULL)
+		return -FI_EINVAL;
+
+	head = &uet_dom->ep_list_head;
+
+	uet_rw_lock(&uet_dom->ep_lock, UET_RW_LOCK_RD_ACCESS);
+
+	dlist_foreach(head, item) {
+		uet_ep = container_of(item, struct uet_ep, ep_list_entry);
+
+		pthread_mutex_lock(&uet_ep->data_lock);
+		uet_ep_progress_locked(uet_ep);
+		pthread_mutex_unlock(&uet_ep->data_lock);
+	}
+
+	uet_rw_unlock(&uet_dom->ep_lock, UET_RW_LOCK_RD_ACCESS);
+
+	return FI_SUCCESS;
+}
+
+ssize_t uet_cq_read(uet_cq_handle_t cq_handle, void *buf, size_t count)
+{
+	struct uet_cq *cq;
+	struct uet_ep *uet_ep;
+	struct uet_ring *ring;
+	ssize_t cq_count, rd_count, max_rd_count;
+	char *buffer = buf;
+
+	cq = (struct uet_cq *) cq_handle;
+	uet_ep = cq->uet_ep;
+
+	pthread_mutex_lock(&uet_ep->data_lock);
+
+	uet_ep_progress_locked(uet_ep);
 
 	ring = &cq->ring;
 	cq_count = uet_ring_entry_cnt(ring);
@@ -6671,7 +7540,7 @@ ssize_t uet_recv(uet_ep_handle_t ep_handle, uint32_t job_id,
 
 	return (uet_recv_api_common(UET_RECV_API, ep_handle, job_id, &iov, 1,
 				    mr_handle, src_addr_handle, UET_NO_TAG,
-				    UET_NO_IGNORE_BITS, context));
+				    UET_NO_IGNORE_BITS, context, NULL, 0));
 }
 
 ssize_t uet_recvv(
@@ -6681,7 +7550,7 @@ ssize_t uet_recvv(
 {
 	return (uet_recv_api_common(UET_RECV_API, ep_handle, job_id, iov, count,
 				    mr_handle, src_addr_handle, UET_NO_TAG,
-				    UET_NO_IGNORE_BITS, context));
+				    UET_NO_IGNORE_BITS, context, NULL, 0));
 }
 
 #else
@@ -6698,7 +7567,7 @@ ssize_t uet_recv(uet_ep_handle_t ep_handle, uint32_t job_id,
 
 	return (uet_recv_api_common(UET_RECV_API, ep_handle, job_id, &iov, 1,
 				    mr_handle, src_addr_handle, UET_NO_TAG,
-				    UET_NO_IGNORE_BITS, context));
+				    UET_NO_IGNORE_BITS, context, NULL, 0));
 }
 
 ssize_t uet_recvv(
@@ -6708,7 +7577,8 @@ ssize_t uet_recvv(
 {
 	return (uet_recv_api_common(UET_RECV_API, ep_handle, job_id, iov,
 				    count, mr_handle, src_addr_handle,
-				    UET_NO_TAG, UET_NO_IGNORE_BITS, context));
+				    UET_NO_TAG, UET_NO_IGNORE_BITS, context,
+				    NULL, 0));
 }
 
 #endif /* ENABLE_VERBS */
@@ -6721,7 +7591,7 @@ ssize_t uet_trecvv(uet_ep_handle_t ep_handle, uint32_t job_id,
 {
 	return (uet_recv_api_common(UET_TRECV_API, ep_handle, job_id, iov,
 				    count, mr_handle, src_addr_handle, tag,
-				    ignore, context));
+				    ignore, context, NULL, 0));
 }
 
 #if !ENABLE_VERBS
@@ -6738,7 +7608,7 @@ ssize_t uet_send(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_SEND_API, ep_handle, job_id, &iov, 1, mr_handle,
 			dst_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context));
+			NULL, context, NULL, 0));
 }
 
 ssize_t uet_sendv(
@@ -6750,7 +7620,7 @@ ssize_t uet_sendv(
 			UET_SEND_API, ep_handle, job_id, iov, count, mr_handle,
 			dst_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context));
+			NULL, context, NULL, 0));
 }
 
 #else
@@ -6768,7 +7638,7 @@ ssize_t uet_send(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_SEND_API, ep_handle, job_id, &iov, 1, mr_handle,
 			dst_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context, resource_index));
+			NULL, context, resource_index, NULL, 0));
 }
 
 ssize_t uet_sendv(
@@ -6781,7 +7651,7 @@ ssize_t uet_sendv(
 			UET_SEND_API, ep_handle, job_id, iov, count, mr_handle,
 			dst_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context, resource_index));
+			NULL, context, resource_index, NULL, 0));
 }
 
 ssize_t uet_send_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -6798,7 +7668,7 @@ ssize_t uet_send_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_SEND_API, ep_handle, job_id, &iov, 1, mr_handle,
 			dst_addr_handle, UET_NO_TAG, imm_data,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context, resource_index));
+			NULL, context, resource_index, NULL, 0));
 }
 
 ssize_t uet_sendv_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -6811,7 +7681,7 @@ ssize_t uet_sendv_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_SEND_API, ep_handle, job_id, iov, count, mr_handle,
 			dst_addr_handle, UET_NO_TAG, imm_data,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context, resource_index));
+			NULL, context, resource_index, NULL, 0));
 }
 #endif /* ENABLE_VERBS */
 
@@ -6825,7 +7695,7 @@ ssize_t uet_tsendv(
 			UET_TSEND_API, ep_handle, job_id, iov, count, mr_handle,
 			dst_addr_handle, tag, UET_NO_IMM_DATA,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context));
+			NULL, context, NULL, 0));
 }
 #endif
 
@@ -6841,7 +7711,7 @@ ssize_t uet_trecv(uet_ep_handle_t ep_handle, uint32_t job_id,
 
 	return (uet_recv_api_common(UET_TRECV_API, ep_handle, job_id, &iov, 1,
 				    mr_handle, src_addr_handle, tag, ignore,
-				    context));
+				    context, NULL, 0));
 }
 
 #if !ENABLE_VERBS
@@ -6859,7 +7729,7 @@ ssize_t uet_tsend(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_TSEND_API, ep_handle, job_id, &iov, 1, mr_handle,
 			dst_addr_handle, tag, UET_NO_IMM_DATA,
 			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
-			NULL, context));
+			NULL, context, NULL, 0));
 }
 #endif
 
@@ -6894,19 +7764,32 @@ int uet_mr_reg(uet_domain_handle_t domain_handle, const void *buf, size_t len,
 			   flags, context, mr_handle);
 }
 
-int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
-		size_t iov_count, uint64_t access, uint64_t requested_key,
-		uint64_t flags, void *context, uet_mr_handle_t *mr_handle)
+/* log2 of a power-of-two page size */
+static unsigned int uet_log2(uint32_t v)
+{
+	unsigned int n = 0;
+
+	while ((v >>= 1) != 0)
+		n++;
+
+	return n;
+}
+
+/*
+ * allocate a memory region key and descriptor index
+ *
+ * Shared by every registration entry point, the key spaces and the
+ * descriptor index are independent of how the region's memory is
+ * described.
+ */
+static int uet_mr_alloc_key(struct uet_domain *uet_dom, uint64_t requested_key,
+			    uint64_t flags, uint64_t *out_key,
+			    uint64_t *out_rkey, size_t *out_mr_index)
 {
 	int rc;
 	uint64_t key, rkey;
 	bool desc_allocated;
-	size_t mr_index, msg_len = 0;
-	struct uet_domain *uet_dom;
-	struct uet_mr_desc *mr_desc;
-	struct iovec *iov_handle;
-
-	uet_dom = (struct uet_domain *) domain_handle;
+	size_t mr_index;
 
 	/*
 	 * The provider maintains two independent memory-region lookup spaces:
@@ -6974,10 +7857,108 @@ int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
 			return rc;
 	}
 
-	/* A contiguous registration stores the buffer directly. Only retain a
-	 * private iovec copy for a real scatter/gather registration.
+	*out_key = key;
+	*out_rkey = rkey;
+	*out_mr_index = mr_index;
+	return FI_SUCCESS;
+}
+
+int uet_mr_reg_pbl(uet_domain_handle_t domain_handle, uet_dma_addr_t pbl_root,
+		   uint32_t page_size, uet_pbl_level_t level,
+		   uint32_t page_offset, uint64_t base_va, size_t len,
+		   uint64_t access, uint64_t requested_key, uint64_t flags,
+		   void *context, uet_mr_handle_t *mr_handle)
+{
+	int rc;
+	uint64_t key, rkey;
+	size_t mr_index;
+	struct uet_domain *uet_dom;
+	struct uet_mr_desc *mr_desc;
+
+	uet_dom = (struct uet_domain *)domain_handle;
+
+	/* a page size must be a non-zero power of two */
+	if ((page_size == 0) || ((page_size & (page_size - 1)) != 0)) {
+		UET_API_ERR("PBL page size must be a power of 2");
+		return -FI_EINVAL;
+	}
+
+	if (page_offset >= page_size) {
+		UET_API_ERR("PBL page offset must be within the first page");
+		return -FI_EINVAL;
+	}
+
+	switch (level) {
+	case UET_PBL_LEVEL_0:
+	case UET_PBL_LEVEL_1:
+	case UET_PBL_LEVEL_2:
+		break;
+	default:
+		UET_API_ERR("Invalid PBL level");
+		return -FI_EINVAL;
+	}
+
+	rc = uet_mr_alloc_key(uet_dom, requested_key, flags, &key, &rkey,
+			      &mr_index);
+	if (rc != FI_SUCCESS)
+		return rc;
+
+	mr_desc = &uet_dom->mr_desc[mr_index];
+	memset(mr_desc, 0, sizeof(struct uet_mr_desc));
+	mr_desc->state = UET_MR_DESC_STATE_DISABLED_REG;
+	mr_desc->uet_dom = uet_dom;
+
+	/*
+	 * buf stays NULL: a page list has no single base address. len is the
+	 * region's length in its flattened address space, which every bounds
+	 * check in the rma paths already tests against.
 	 */
-	iov_handle = NULL;
+	mr_desc->buf_desc.type = UET_MR_BUF_TYPE_PBL;
+	mr_desc->buf_desc.len = len;
+	mr_desc->buf_desc.pbl.root = pbl_root;
+	mr_desc->buf_desc.pbl.page_size = page_size;
+	mr_desc->buf_desc.pbl.page_offset = page_offset;
+	mr_desc->buf_desc.pbl.page_shift = (uint8_t)uet_log2(page_size);
+	mr_desc->buf_desc.pbl.level = level;
+
+	mr_desc->access = access;
+	mr_desc->flags = flags;
+	mr_desc->context = context;
+	mr_desc->full_key = key;
+	mr_desc->hash_key.rkey = rkey;
+	mr_desc->user_key = !!(flags & UET_MR_FLAG_USER_KEY);
+	mr_desc->base_va = base_va;
+
+	*mr_handle = mr_desc;
+
+	return FI_SUCCESS;
+}
+
+int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
+		size_t iov_count, uint64_t access, uint64_t requested_key,
+		uint64_t flags, void *context, uet_mr_handle_t *mr_handle)
+{
+	int rc;
+	uint64_t key, rkey;
+	size_t mr_index, tot_len = 0;
+	struct uet_domain *uet_dom;
+	struct uet_mr_desc *mr_desc;
+	struct iovec *iov_handle = NULL;
+
+	uet_dom = (struct uet_domain *)domain_handle;
+
+	rc = uet_mr_alloc_key(uet_dom, requested_key, flags, &key, &rkey,
+			      &mr_index);
+	if (rc != FI_SUCCESS)
+		return rc;
+
+	for (int i = 0; i < iov_count; i++)
+		tot_len += iov[i].iov_len;
+
+	/* Only a multi-entry region needs a private copy of the vector; a
+	 * single-entry region is recorded as a contiguous buffer and keeps
+	 * no vector at all
+	 */
 	if (iov_count > 1) {
 		iov_handle = calloc(iov_count, sizeof(struct iovec));
 		if (iov_handle == NULL) {
@@ -6985,11 +7966,8 @@ int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
 					    &uet_dom->mr_desc[mr_index]);
 			return -FI_ENOMEM;
 		}
-	}
 
-	for (int i = 0; i < iov_count; i++) {
-		msg_len += iov[i].iov_len;
-		if (iov_handle)
+		for (int i = 0; i < iov_count; i++)
 			iov_handle[i] = iov[i];
 	}
 
@@ -7004,7 +7982,7 @@ int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
 		mr_desc->buf_desc.len = iov->iov_len;
 	} else {
 		mr_desc->buf_desc.type = UET_MR_BUF_TYPE_IOV;
-		mr_desc->buf_desc.len = msg_len;
+		mr_desc->buf_desc.len = tot_len;
 		mr_desc->buf_desc.iov.iov = iov_handle;
 		mr_desc->buf_desc.iov.iov_count = iov_count;
 	}
@@ -7014,6 +7992,9 @@ int uet_mr_regv(uet_domain_handle_t domain_handle, const struct iovec *iov,
 	mr_desc->full_key = key;
 	mr_desc->hash_key.rkey = rkey;
 	mr_desc->user_key = !!(flags & UET_MR_FLAG_USER_KEY);
+
+	/* zero-based: addresses naming this region are offsets */
+	mr_desc->base_va = 0;
 
 	*mr_handle = mr_desc;
 
@@ -7133,12 +8114,26 @@ int uet_mr_enable(uet_mr_handle_t mr_handle)
 		return -FI_EINVAL;
 	}
 
-	if (mr_desc->buf_desc.type != UET_MR_BUF_TYPE_CONTIG) {
-		UET_API_ERR("MR reg only supported for contiguous buf type");
+	switch (mr_desc->buf_desc.type) {
+	case UET_MR_BUF_TYPE_CONTIG:
+		mr_desc->buf_desc.contig.dma_addr =
+			(uet_dma_addr_t)mr_desc->buf_desc.buf;
+		break;
+
+	case UET_MR_BUF_TYPE_IOV:
+	case UET_MR_BUF_TYPE_PBL:
+		/* A scattered region has no single base address, so
+		 * buf_desc.buf stays NULL and every consumer must branch on
+		 * buf_desc.type rather than dereference it. Per-entry
+		 * addresses live in buf_desc.iov or buf_desc.pbl.
+		 */
+		break;
+
+	default:
+		UET_API_ERR("MR reg only supported for contiguous and iov "
+			    "buf types");
 		return -FI_EINVAL;
 	}
-
-	mr_desc->buf_desc.contig.dma_addr = (uet_dma_addr_t) mr_desc->buf_desc.buf;
 
 	/*
 	 * Insert into the lookup space that matches the key's origin: user
@@ -7205,7 +8200,7 @@ ssize_t uet_write(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
 	return (uet_send_req_api_common(
 			UET_WRITE_API, ep_handle, job_id, &iov, 1, mr_handle,
 			dst_addr_handle, UET_NO_TAG, data, remote_mem_addr,
-			remote_key, NULL, context));
+			remote_key, NULL, context, NULL, 0));
 }
 
 ssize_t uet_write_sync(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
@@ -7222,7 +8217,7 @@ ssize_t uet_write_sync(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
 	return (uet_send_req_api_common(
 			UET_WRITE_SYNC_API, ep_handle, job_id, &iov, 1,
 			mr_handle, dst_addr_handle, UET_NO_TAG, data,
-			remote_mem_addr, remote_key, NULL, context));
+			remote_mem_addr, remote_key, NULL, context, NULL, 0));
 }
 
 ssize_t uet_read(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
@@ -7238,7 +8233,7 @@ ssize_t uet_read(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
 	return (uet_send_req_api_common(
 			UET_READ_API, ep_handle, job_id, &iov, 1, mr_handle,
 			uet_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
-			remote_mem_addr, remote_key, NULL, context));
+			remote_mem_addr, remote_key, NULL, context, NULL, 0));
 }
 
 #else
@@ -7256,7 +8251,7 @@ ssize_t uet_write(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
 	return (uet_send_req_api_common(
 			UET_WRITE_API, ep_handle, job_id, &iov, 1, mr_handle,
 			dst_addr_handle, UET_NO_TAG, data, remote_mem_addr,
-			remote_key, NULL, context, resource_index));
+			remote_key, NULL, context, resource_index, NULL, 0));
 }
 
 ssize_t uet_write_sync(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
@@ -7274,7 +8269,7 @@ ssize_t uet_write_sync(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
 			UET_WRITE_SYNC_API, ep_handle, job_id, &iov, 1,
 			mr_handle, dst_addr_handle, UET_NO_TAG, data,
 			remote_mem_addr, remote_key, NULL, context,
-			resource_index));
+			resource_index, NULL, 0));
 }
 
 ssize_t uet_read(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
@@ -7292,7 +8287,7 @@ ssize_t uet_read(uet_ep_handle_t ep_handle, uint32_t job_id, void *buf,
 			UET_READ_API, ep_handle, job_id, &iov, 1, mr_handle,
 			uet_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
 			remote_mem_addr, remote_key, NULL, context,
-			resource_index));
+			resource_index, NULL, 0));
 }
 
 ssize_t uet_writev(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -7304,7 +8299,7 @@ ssize_t uet_writev(uet_ep_handle_t ep_handle, uint32_t job_id,
 	return (uet_send_req_api_common(
 			UET_WRITE_API, ep_handle, job_id, iov, count, mr_handle,
 			dst_addr_handle, UET_NO_TAG, data, remote_mem_addr,
-			remote_key, NULL, context, resource_index));
+			remote_key, NULL, context, resource_index, NULL, 0));
 }
 
 ssize_t uet_readv(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -7317,9 +8312,124 @@ ssize_t uet_readv(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_READ_API, ep_handle, job_id, iov, count, mr_handle,
 			uet_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
 			remote_mem_addr, remote_key, NULL, context,
-			resource_index));
+			resource_index, NULL, 0));
 }
 #endif /* ENABLE_VERBS */
+
+/*
+ * Segment-list variants. The local buffer is described by memory regions
+ * rather than by addresses in this process, everything else matches the
+ * corresponding iov form.
+ */
+#if !ENABLE_VERBS
+ssize_t uet_sendseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t dst_addr_handle, void *context)
+{
+	return (uet_send_req_api_common(
+			UET_SEND_API, ep_handle, job_id, NULL, 0, NULL,
+			dst_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
+			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
+			NULL, context, seg, seg_count));
+}
+
+ssize_t uet_sendseg_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
+			const struct uet_mr_seg *seg, size_t seg_count,
+			uint64_t *data, uet_addr_handle_t dst_addr_handle,
+			void *context)
+{
+	return (uet_send_req_api_common(
+			UET_SEND_API, ep_handle, job_id, NULL, 0, NULL,
+			dst_addr_handle, UET_NO_TAG, data,
+			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
+			NULL, context, seg, seg_count));
+}
+
+ssize_t uet_writeseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		     const struct uet_mr_seg *seg, size_t seg_count,
+		     uint64_t *data, uet_addr_handle_t dst_addr_handle,
+		     uint64_t remote_mem_addr, uint64_t remote_key,
+		     void *context)
+{
+	return (uet_send_req_api_common(
+			UET_WRITE_API, ep_handle, job_id, NULL, 0, NULL,
+			dst_addr_handle, UET_NO_TAG, data, remote_mem_addr,
+			remote_key, NULL, context, seg, seg_count));
+}
+
+ssize_t uet_readseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t uet_addr_handle,
+		    uint64_t remote_mem_addr, uint64_t remote_key,
+		    void *context)
+{
+	return (uet_send_req_api_common(
+			UET_READ_API, ep_handle, job_id, NULL, 0, NULL,
+			uet_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
+			remote_mem_addr, remote_key, NULL, context,
+			seg, seg_count));
+}
+#else
+ssize_t uet_sendseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t dst_addr_handle, void *context,
+		    uint16_t resource_index)
+{
+	return (uet_send_req_api_common(
+			UET_SEND_API, ep_handle, job_id, NULL, 0, NULL,
+			dst_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
+			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
+			NULL, context, resource_index, seg, seg_count));
+}
+
+ssize_t uet_sendseg_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
+			const struct uet_mr_seg *seg, size_t seg_count,
+			uint64_t *data, uet_addr_handle_t dst_addr_handle,
+			void *context, uint16_t resource_index)
+{
+	return (uet_send_req_api_common(
+			UET_SEND_API, ep_handle, job_id, NULL, 0, NULL,
+			dst_addr_handle, UET_NO_TAG, data,
+			UET_NO_REMOTE_MEM_ADDR, UET_NO_REMOTE_KEY,
+			NULL, context, resource_index, seg, seg_count));
+}
+
+ssize_t uet_writeseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		     const struct uet_mr_seg *seg, size_t seg_count,
+		     uint64_t *data, uet_addr_handle_t dst_addr_handle,
+		     uint64_t remote_mem_addr, uint64_t remote_key,
+		     void *context, uint16_t resource_index)
+{
+	return (uet_send_req_api_common(
+			UET_WRITE_API, ep_handle, job_id, NULL, 0, NULL,
+			dst_addr_handle, UET_NO_TAG, data, remote_mem_addr,
+			remote_key, NULL, context, resource_index,
+			seg, seg_count));
+}
+
+ssize_t uet_readseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t uet_addr_handle,
+		    uint64_t remote_mem_addr, uint64_t remote_key,
+		    void *context, uint16_t resource_index)
+{
+	return (uet_send_req_api_common(
+			UET_READ_API, ep_handle, job_id, NULL, 0, NULL,
+			uet_addr_handle, UET_NO_TAG, UET_NO_IMM_DATA,
+			remote_mem_addr, remote_key, NULL, context,
+			resource_index, seg, seg_count));
+}
+#endif /* ENABLE_VERBS */
+
+ssize_t uet_recvseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t src_addr_handle, void *context)
+{
+	return (uet_recv_api_common(UET_RECV_API, ep_handle, job_id, NULL, 0,
+				    NULL, src_addr_handle, UET_NO_TAG,
+				    UET_NO_IGNORE_BITS, context,
+				    seg, seg_count));
+}
 
 int uet_query_atomic(uet_domain_handle_t domain_handle,
 		     enum fi_datatype datatype, enum fi_op op,
@@ -7427,7 +8537,7 @@ ssize_t uet_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
                         UET_ATOMIC_API, ep_handle, job_id, &iov, 1,
                         mr_handle, dst_addr_handle, UET_NO_TAG,
                         UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-                        &parms, context));
+                        &parms, context, NULL, 0));
 }
 #else
 ssize_t uet_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -7454,7 +8564,7 @@ ssize_t uet_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
                         UET_ATOMIC_API, ep_handle, job_id, &iov, 1,
                         mr_handle, dst_addr_handle, UET_NO_TAG,
                         UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-                        &parms, context, resource_index));
+                        &parms, context, resource_index, NULL, 0));
 }
 #endif
 
@@ -7483,7 +8593,7 @@ ssize_t uet_atomic_sync(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_ATOMIC_SYNC_API, ep_handle, job_id, &iov, 1,
 			mr_handle, dst_addr_handle, UET_NO_TAG,
 			UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-			&parms, context));
+			&parms, context, NULL, 0));
 }
 #else
 ssize_t uet_atomic_sync(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -7510,7 +8620,7 @@ ssize_t uet_atomic_sync(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_ATOMIC_SYNC_API, ep_handle, job_id, &iov, 1,
 			mr_handle, dst_addr_handle, UET_NO_TAG,
 			UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-			&parms, context, resource_index));
+			&parms, context, resource_index, NULL, 0));
 }
 #endif
 
@@ -7542,7 +8652,7 @@ ssize_t uet_fetch_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_FETCH_ATOMIC_API, ep_handle, job_id, &iov, 1,
 			op_mr_handle, dst_addr_handle, UET_NO_TAG,
 			UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-			&parms, context));
+			&parms, context, NULL, 0));
 }
 #else
 ssize_t uet_fetch_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -7573,7 +8683,7 @@ ssize_t uet_fetch_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_FETCH_ATOMIC_API, ep_handle, job_id, &iov, 1,
 			op_mr_handle, dst_addr_handle, UET_NO_TAG,
 			UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-			&parms, context, resource_index));
+			&parms, context, resource_index, NULL, 0));
 }
 #endif /* ENABLE_VERBS */
 
@@ -7606,7 +8716,7 @@ ssize_t uet_compare_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_COMPARE_ATOMIC_API, ep_handle, job_id, &iov, 1,
 			op_mr_handle, dst_addr_handle, UET_NO_TAG,
 			UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-			&parms, context));
+			&parms, context, NULL, 0));
 }
 #else
 ssize_t uet_compare_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
@@ -7638,7 +8748,7 @@ ssize_t uet_compare_atomic(uet_ep_handle_t ep_handle, uint32_t job_id,
 			UET_COMPARE_ATOMIC_API, ep_handle, job_id, &iov, 1,
 			op_mr_handle, dst_addr_handle, UET_NO_TAG,
 			UET_NO_IMM_DATA, remote_mem_addr, remote_key,
-			&parms, context, resource_index));
+			&parms, context, resource_index, NULL, 0));
 }
 #endif /* ENABLE_VERBS */
 

@@ -75,6 +75,45 @@ typedef void *uet_cntr_handle_t;    /* handle for counter instance */
 typedef void *uet_addr_handle_t;    /* handle for uet address */
 typedef void *uet_mr_handle_t;      /* handle for memory region */
 
+/*
+ * An address as a device would see it on the bus. When the implementation
+ * runs in the address space that owns the memory, the standalone app and
+ * the libfabric provider, this is simply a process address. When it runs
+ * as a device model on behalf of another address space, it is whatever the
+ * driver programmed, and only that device model can resolve it.
+ */
+typedef uint64_t uet_dma_addr_t;
+
+/*
+ * One segment of a local buffer, naming a range within a memory region.
+ *
+ * A local buffer is an array of these. Each element carries its own region,
+ * so a single operation can span several regions (the same thing an
+ * ibv_sge[] expresses) where every entry has its own lkey.
+ *
+ * The region a segment names may be contiguous, a scatter/gather list, or a
+ * page list. The segment does not care and neither does anything that walks
+ * one.
+ */
+struct uet_mr_seg {
+	uet_mr_handle_t mr;                   /* region this segment lives in */
+	        /* Address within the region in whichever convention the      */
+	        /* region was registered with. An offset from zero when its   */
+	        /* base_va is 0, otherwise a virtual address.                 */
+	uint64_t addr;
+	size_t len;                                  /* bytes in this segment */
+};
+
+/*
+ * Page buffer list levels, as a device driver builds them after pinning
+ * the pages behind a user VA range.
+ */
+typedef enum {
+	UET_PBL_LEVEL_0 = 0, /* the region's data pages are contiguous */
+	UET_PBL_LEVEL_1,     /* root is a directory of data page addresses */
+	UET_PBL_LEVEL_2,     /* root is a directory of directories */
+} uet_pbl_level_t;
+
 /* event callback functions */
 typedef void (*uet_eq_callback_t)(uet_handle_t handle,
 				  struct fi_eq_entry *eq_entry);
@@ -338,6 +377,46 @@ int uet_mr_reg_job(uet_domain_handle_t domain_handle, const void *buf,
 		   size_t len, uint64_t access, uint64_t requested_key,
 		   uint64_t flags, uint32_t job_id, void *context,
 		   uet_mr_handle_t *mr_handle);
+
+/*
+ * register a memory region described by a page buffer list
+ *
+ * This is the registration a device driver performs: the pages behind a
+ * user VA range have been pinned and enumerated into a page list, and the
+ * region is named by that list rather than by an address in this process.
+ *
+ * Resolving an offset is arithmetic, not a walk, because every page is the
+ * same size. The list is read in place rather than copied, so registration
+ * cost does not grow with the size of the region.
+ *
+ * parms:
+ *   domain_handle - handle identifying uet domain instance
+ *   pbl_root      - level 0: the region's contiguous data pages
+ *                   level 1: a directory of data page addresses
+ *                   level 2: a directory of directories of data page addresses
+ *   page_size     - bytes per page, a power of 2
+ *   level         - page list level, see uet_pbl_level_t
+ *   page_offset   - offset of the region within its first page, which is
+ *                   how an unaligned base VA is expressed. Must be less
+ *                   than page_size.
+ *   base_va       - virtual address the region starts at, which also
+ *                   selects how addresses naming it are interpreted
+ *   len           - length of the region in bytes
+ *   access        - memory access permissions, see fi_mr
+ *   requested_key - requested key for the region
+ *   flags         - properties of the region
+ *   context       - for completion
+ *   mr_handle     - location where the region handle is returned
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+int uet_mr_reg_pbl(uet_domain_handle_t domain_handle, uet_dma_addr_t pbl_root,
+		   uint32_t page_size, uet_pbl_level_t level,
+		   uint32_t page_offset, uint64_t base_va, size_t len,
+		   uint64_t access, uint64_t requested_key, uint64_t flags,
+		   void *context, uet_mr_handle_t *mr_handle);
 
 /*
  * get memory region protection key
@@ -783,6 +862,51 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
  *   negative value corresponding to fabric errno on error
  */
 int uet_ep_close(uet_ep_handle_t ep_handle);
+
+/*******************************************************************
+ * uet_progress API family
+ *******************************************************************/
+
+/*
+ * run one progress cycle for every endpoint on a domain
+ *
+ * Ages idle receive messages and receive sync groups, drives receive
+ * packets through the PDS, drives pending transmits, and retries deferred
+ * transmit messages.
+ *
+ * uet_cq_read() performs the same work for the endpoint it is reading, so
+ * an application that polls its completion queues does not need to call
+ * this. It exists for callers that must make progress independently of
+ * completion queue polling. Retransmission timeouts, PDC establishment, and
+ * packet reception all require progress even when no completions are being
+ * read.
+ *
+ * One receive packet is processed per endpoint per call, so a caller acting
+ * as a progress engine should call this repeatedly rather than once.
+ *
+ * parms:
+ *   domain_handle - handle identifying uet domain instance
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+int uet_progress(uet_domain_handle_t domain_handle);
+
+/*
+ * run one progress cycle for a single endpoint
+ *
+ * Performs exactly the progress work that uet_cq_read() performs before
+ * reading completions, without reading any.
+ *
+ * parms:
+ *   ep_handle - handle identifying uet endpoint instance
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+int uet_ep_progress(uet_ep_handle_t ep_handle);
 
 /*******************************************************************
  * uet_cq API family
@@ -1557,6 +1681,90 @@ ssize_t uet_readv(uet_ep_handle_t ep_handle, uint32_t job_id,
 		  uet_mr_handle_t mr_handle, uet_addr_handle_t uet_addr_handle,
 		  uint64_t remote_mem_addr, uint64_t remote_key,
 		  void *context, uint16_t resource_index);
+#endif
+
+/*******************************************************************
+ * uet_*seg API family
+ *******************************************************************/
+
+/*
+ * Segment-list variants of the send, receive, write and read operations.
+ *
+ * Where the iov forms describe a local buffer with addresses in this
+ * process, these describe it with memory regions: an array of uet_mr_seg
+ * strutures, each naming a range within its own region. That is what an
+ * ibv_sge[] expresses (where every entry carries its own lkey) and it lets
+ * one operation span several regions.
+ *
+ * The regions may be contiguous, scatter/gather lists, or page lists; the
+ * operation does not care.
+ *
+ * parms:
+ *   ep_handle       - handle identifying uet endpoint instance
+ *   job_id          - id of the job
+ *   seg             - array of segments describing the local buffer
+ *   seg_count       - number of segments
+ *   data            - immediate data, or NULL
+ *   dst_addr_handle - handle identifying the peer
+ *   remote_mem_addr - address within the remote region (rma only)
+ *   remote_key      - key of the remote region (rma only)
+ *   context         - for completion
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+#if !ENABLE_VERBS
+ssize_t uet_sendseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t dst_addr_handle, void *context);
+
+ssize_t uet_sendseg_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
+			const struct uet_mr_seg *seg, size_t seg_count,
+			uint64_t *data, uet_addr_handle_t dst_addr_handle,
+			void *context);
+
+ssize_t uet_recvseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t src_addr_handle, void *context);
+
+ssize_t uet_writeseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		     const struct uet_mr_seg *seg, size_t seg_count,
+		     uint64_t *data, uet_addr_handle_t dst_addr_handle,
+		     uint64_t remote_mem_addr, uint64_t remote_key,
+		     void *context);
+
+ssize_t uet_readseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t uet_addr_handle,
+		    uint64_t remote_mem_addr, uint64_t remote_key,
+		    void *context);
+#else
+ssize_t uet_sendseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t dst_addr_handle, void *context,
+		    uint16_t resource_index);
+
+ssize_t uet_sendseg_imm(uet_ep_handle_t ep_handle, uint32_t job_id,
+			const struct uet_mr_seg *seg, size_t seg_count,
+			uint64_t *data, uet_addr_handle_t dst_addr_handle,
+			void *context, uint16_t resource_index);
+
+ssize_t uet_recvseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t src_addr_handle, void *context);
+
+ssize_t uet_writeseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		     const struct uet_mr_seg *seg, size_t seg_count,
+		     uint64_t *data, uet_addr_handle_t dst_addr_handle,
+		     uint64_t remote_mem_addr, uint64_t remote_key,
+		     void *context, uint16_t resource_index);
+
+ssize_t uet_readseg(uet_ep_handle_t ep_handle, uint32_t job_id,
+		    const struct uet_mr_seg *seg, size_t seg_count,
+		    uet_addr_handle_t uet_addr_handle,
+		    uint64_t remote_mem_addr, uint64_t remote_key,
+		    void *context, uint16_t resource_index);
 #endif
 
 /*
