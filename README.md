@@ -50,9 +50,10 @@ layers. The second PDS implementation is fully featured transport based on the
 UET PDS Specification. It supports the RUD, ROD, RUDI, and UUD delivery modes
 (see [Delivery Modes](#delivery-modes) below).
 
-There are currently two implementations of the NIC shim interface APIs:
+There are currently three implementations of the NIC shim interface APIs:
 - Raw Ethernet socket
 - AF_XDP
+- VPP
 
 Testing is performed using a simple top-level program that performs ping-pong
 message data transfer operations between a client and a server (see `uet.c`).
@@ -221,6 +222,34 @@ application segment per process and provide its name, DMA socket, local IP
 address and optional MTU through the variables below. The plugin architecture,
 VPP CLI and manual low-level tests are documented in
 [`vpp-plugin/README.md`](vpp-plugin/README.md).
+
+#### UET Verbs through uprot
+
+The same VPP NIC shim can be exposed to applications using the experimental
+UET Verbs API through the `uprot` libibverbs provider. Build a separate shared
+library so that the normal `libuet_verbs.so` keeps its existing NIC backend and
+does not acquire a VPP runtime dependency:
+
+```sh
+make vpp-verbs \
+  LIBFABRIC=/path/to/libfabric \
+  VPP_PLUGIN_BUILD=build/vpp-plugin
+```
+
+This produces `libuet_verbs_vpp.so`. Select it while configuring
+`uet-rdma-core`:
+
+```sh
+UET_REF_PROV_PATH=/path/to/uet-ref-prov \
+cmake -S /path/to/uet-rdma-core -B /path/to/uet-rdma-core/build \
+  -DUET_REF_PROV_LIB=/path/to/uet-ref-prov/libuet_verbs_vpp.so
+```
+
+Applications continue to use the standard `libibverbs` API. At runtime,
+`libibverbs` loads the `uprot` provider, which calls `libuet_verbs_vpp.so`; that
+library sends and receives packets through `libuet_vpp_client.so` and the VPP
+plugin. Configure the VPP segment and interface with the same `UET_VPP_*`
+variables used by the standalone VPP build.
 
 ### CC Tester
 
