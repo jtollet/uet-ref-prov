@@ -1,17 +1,21 @@
+# UET Reference Provider
 
-# UEC Reference Provider (libfabric)
+This repository provides a reference implementation of the UET transport
+specifications. The transport engine can be built for the standalone test
+application and consumed through libfabric or the experimental UET Verbs
+path. It includes:
 
-This repository provides a reference implementation of the UEC transport
-specifications including:
 - Semantic Sublayer (SES)
 - Packet Delivery Sublayer (PDS) - Reliability and Congestion Management
 - Transport Security Sublayer (TSS) - Encryption and Integrity
 
-See SDR4001 and the UEC Libfabric Mapping Specification for additional details.
+See SDR4001, the UEC Libfabric Mapping Specification, and the UET Verbs
+Specification for additional details.
 
 ## Goals
 
-- Reference implementation of the libfabric mapping, semantic, packet delivery, and security layers
+- Reference implementation of the semantic, packet delivery, and security
+  layers used by the libfabric and UET Verbs mappings
 - Investigate lower-level interfaces in libfabric (memory management)
 - Provide a framework to define Linux kernel interfaces (i.e., netlink)
 - Development/integration vehicle for higher level libraries (i.e, xCCL)
@@ -29,6 +33,23 @@ SES, PDS, TSS, and NIC.
 - PDS interfaces with TSS via PDS-TSS APIs (see uet_sec.h)
 - The NIC shim interface is accessed via a set of abstracted APIs (see
 uet_nic.h).
+
+The application-facing adapters live in separate repositories. This table
+shows where the libraries fit; it does not imply that libfabric and Verbs use
+the same API.
+
+| Layer | libfabric path | UET Verbs path |
+| --- | --- | --- |
+| Example application | `fi_pingpong` | `ibv_ru_pingpong`, `ibv_ru_rma` |
+| Standard userspace API | `libfabric.so` | `libibverbs.so` |
+| UET adapter | `libuet-fi.so` from `uet-libfabric` | `libuprot-rdmav57.so` from `uet-rdma-core` |
+| Reference transport built here | `libuet_fabric.so`, or a backend-specific build such as `libvppuet.so` | `libuet_verbs.so`, or `libuet_verbs_vpp.so` for VPP |
+| VPP client, when selected | `libuet_vpp_client.so` | `libuet_vpp_client.so` |
+| VPP dataplane, when selected | `uet_plugin.so` | `uet_plugin.so` |
+
+The `-fi` suffix identifies the libfabric-facing provider; `fi` is short for
+Fabric Interface. Libfabric itself is an OpenFabrics API and is not specific
+to Ultra Ethernet.
 
 The current SES implementation supports a subset of the functionality required
 for:
@@ -232,11 +253,13 @@ does not acquire a VPP runtime dependency:
 
 ```sh
 make vpp-verbs \
-  LIBFABRIC=/path/to/libfabric \
+  LIBFABRIC="$PWD/libfabric_headers" \
   VPP_PLUGIN_BUILD=build/vpp-plugin
 ```
 
-This produces `libuet_verbs_vpp.so`. Select it while configuring
+The common Makefile still requires its `LIBFABRIC` argument, but this target
+uses the bundled compatibility headers and does not link `libfabric.so`. It
+produces `libuet_verbs_vpp.so`. Select that library while configuring
 `uet-rdma-core`:
 
 ```sh
@@ -250,6 +273,12 @@ Applications continue to use the standard `libibverbs` API. At runtime,
 library sends and receives packets through `libuet_vpp_client.so` and the VPP
 plugin. Configure the VPP segment and interface with the same `UET_VPP_*`
 variables used by the standalone VPP build.
+
+For a reproducible AF_PACKET test using two network namespaces, see
+[`vpp-plugin/GETTING_STARTED_VERBS.md`](vpp-plugin/GETTING_STARTED_VERBS.md).
+The guide separates compatibility requirements from the exact configuration
+used for validation: its Linux and VPP versions are reference points, not
+general minimum-version requirements.
 
 ### CC Tester
 
