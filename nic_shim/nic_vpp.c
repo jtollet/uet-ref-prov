@@ -714,7 +714,9 @@ int nic_vpp_get_nh(struct uet_nic *nic, const struct uet_fa *fa,
 {
 	/* VPP owns FIB lookup, adjacency resolution and the Ethernet rewrite.
 	 * The existing transport still builds an Ethernet header, so give it a
-	 * stable placeholder which the VPP shim discards on transmit.
+	 * stable placeholder which the VPP shim discards on transmit. Keep it
+	 * distinct from the local MAC so generic NIC loopback does not intercept
+	 * packets destined for a remote endpoint.
 	 */
 	(void)nic;
 	(void)fa;
@@ -723,7 +725,7 @@ int nic_vpp_get_nh(struct uet_nic *nic, const struct uet_fa *fa,
 	mac[0] = 0x02;
 	mac[3] = 0x55;
 	mac[4] = 0x45;
-	mac[5] = 0x54;
+	mac[5] = 0x55;
 	return 0;
 }
 
