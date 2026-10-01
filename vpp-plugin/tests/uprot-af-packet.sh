@@ -94,14 +94,14 @@ unix { nodaemon runtime-dir $runtime/a cli-listen $runtime/a/cli.sock log $runti
 api-segment { prefix uet-uprot-a-$suffix }
 statseg { socket-name $runtime/a/stats.sock }
 cpu { workers 1 }
-plugins { add-path $plugin_dir plugin uet_plugin.so { enable } }
+plugins { add-path $plugin_dir plugin default { disable } plugin af_packet_plugin.so { enable } plugin uet_plugin.so { enable } }
 EOF
 cat >"$runtime/vpp-b.conf" <<EOF
 unix { nodaemon runtime-dir $runtime/b cli-listen $runtime/b/cli.sock log $runtime/vpp-b.log }
 api-segment { prefix uet-uprot-b-$suffix }
 statseg { socket-name $runtime/b/stats.sock }
 cpu { workers 1 }
-plugins { add-path $plugin_dir plugin uet_plugin.so { enable } }
+plugins { add-path $plugin_dir plugin default { disable } plugin af_packet_plugin.so { enable } plugin uet_plugin.so { enable } }
 EOF
 if (( test_uid != 0 )); then
 	chown -R "$test_uid:$test_gid" "$runtime"
