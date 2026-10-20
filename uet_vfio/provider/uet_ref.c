@@ -115,7 +115,7 @@ static struct ibv_job *uet_ref_alloc_job(struct ibv_context *ibctx,
 	struct uet_ref_job *job;
 
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JOB,
-			       UVERBS_METHOD_JOB_ALLOC, 6);
+			       UVERBS_METHOD_JOB_ALLOC, 5);
 
 	if (!attr) {
 		errno = EINVAL;
@@ -134,11 +134,6 @@ static struct ibv_job *uet_ref_alloc_job(struct ibv_context *ibctx,
 		fill_attr_in_uint32(cmd,
 				    UVERBS_ATTR_ALLOC_JOB_MAX_ADDR_ENTRIES,
 				    attr->max_addr_entries);
-	}
-
-	if (attr->comp_mask & IBV_JOB_ATTR_FLAGS) {
-		fill_attr_in_uint32(cmd, UVERBS_ATTR_ALLOC_JOB_FLAGS,
-				    attr->flags);
 	}
 
 	if (attr->comp_mask & IBV_JOB_ATTR_PORT_NUM) {
@@ -183,7 +178,7 @@ static int uet_ref_query_job(struct ibv_job *vjob,
 			     struct ibv_job_attr *attr)
 {
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JOB,
-			       UVERBS_METHOD_JOB_QUERY, 6);
+			       UVERBS_METHOD_JOB_QUERY, 5);
 
 	if (!attr)
 		return EINVAL;
@@ -192,7 +187,6 @@ static int uet_ref_query_job(struct ibv_job *vjob,
 	fill_attr_out_ptr(cmd, UVERBS_ATTR_QUERY_JOB_ID, &attr->id);
 	fill_attr_out_ptr(cmd, UVERBS_ATTR_QUERY_JOB_MAX_ADDR_ENTRIES,
 			  &attr->max_addr_entries);
-	fill_attr_out_ptr(cmd, UVERBS_ATTR_QUERY_JOB_FLAGS, &attr->flags);
 	fill_attr_out_ptr(cmd, UVERBS_ATTR_QUERY_JOB_PORT_NUM,
 			  &attr->port_num);
 	fill_attr_out_ptr(cmd, UVERBS_ATTR_QUERY_JOB_SGID_INDEX,
@@ -201,8 +195,7 @@ static int uet_ref_query_job(struct ibv_job *vjob,
 	if (execute_ioctl(vjob->context, cmd))
 		return errno;
 
-	attr->comp_mask = (IBV_JOB_ATTR_FLAGS |
-			   IBV_JOB_ATTR_ID |
+	attr->comp_mask = (IBV_JOB_ATTR_ID |
 			   IBV_JOB_ATTR_MAX_ADDR_ENTRIES |
 			   IBV_JOB_ATTR_PORT_NUM |
 			   IBV_JOB_ATTR_SGID_INDEX);
@@ -213,6 +206,8 @@ static int uet_ref_query_job(struct ibv_job *vjob,
 static int uet_ref_export_job(struct ibv_job *vjob,
 			      int *fd)
 {
+	struct ib_uverbs_attr *fd_attr;
+
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JOB,
 			       UVERBS_METHOD_JOB_EXPORT, 2);
 
@@ -220,10 +215,12 @@ static int uet_ref_export_job(struct ibv_job *vjob,
 		return EINVAL;
 
 	fill_attr_in_obj(cmd, UVERBS_ATTR_EXPORT_JOB_HANDLE, vjob->handle);
-	fill_attr_out_ptr(cmd, UVERBS_ATTR_EXPORT_JOB_FD, fd);
+	fd_attr = fill_attr_out_fd(cmd, UVERBS_ATTR_EXPORT_JOB_FD, 0);
 
 	if (execute_ioctl(vjob->context, cmd))
 		return errno;
+
+	*fd = read_attr_fd(UVERBS_ATTR_EXPORT_JOB_FD, fd_attr);
 
 	return 0;
 }
@@ -247,7 +244,7 @@ static int uet_ref_import_job(struct ibv_context *ibctx,
 
 	handle = fill_attr_out_obj(cmd, UVERBS_ATTR_IMPORT_JOB_HANDLE);
 
-	fill_attr_in(cmd, UVERBS_ATTR_IMPORT_JOB_FD, &fd, sizeof(fd));
+	fill_attr_in_fd(cmd, UVERBS_ATTR_IMPORT_JOB_FD, fd);
 
 	if (execute_ioctl(ibctx, cmd)) {
 		int err = errno;
@@ -266,13 +263,12 @@ static int uet_ref_import_job(struct ibv_context *ibctx,
 
 static int uet_ref_insert_addr(struct ibv_job *vjob,
 			       struct ibv_ah_attr_ex *ah_attr,
-			       unsigned int addr_idx,
-			       unsigned int flags)
+			       unsigned int addr_idx)
 {
 	struct ib_uverbs_ah_attr_ex uah;
 
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JOB,
-			       UVERBS_METHOD_JOB_ADDR_INSERT, 4);
+			       UVERBS_METHOD_JOB_ADDR_INSERT, 3);
 
 	if (!ah_attr)
 		return EINVAL;
@@ -297,7 +293,6 @@ static int uet_ref_insert_addr(struct ibv_job *vjob,
 	fill_attr_in_uint32(cmd, UVERBS_ATTR_JOB_ADDR_INSERT_INDEX, addr_idx);
 	fill_attr_in(cmd, UVERBS_ATTR_JOB_ADDR_INSERT_AH_ATTR_EX, &uah,
 		     sizeof(uah));
-	fill_attr_in_uint32(cmd, UVERBS_ATTR_JOB_ADDR_INSERT_FLAGS, flags);
 
 	if (execute_ioctl(vjob->context, cmd))
 		return errno;
@@ -306,16 +301,14 @@ static int uet_ref_insert_addr(struct ibv_job *vjob,
 }
 
 static int uet_ref_remove_addr(struct ibv_job *vjob,
-			       unsigned int addr_idx,
-			       unsigned int flags)
+			       unsigned int addr_idx)
 {
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JOB,
-			       UVERBS_METHOD_JOB_ADDR_REMOVE, 3);
+			       UVERBS_METHOD_JOB_ADDR_REMOVE, 2);
 
 	fill_attr_in_obj(cmd, UVERBS_ATTR_JOB_ADDR_REMOVE_HANDLE,
 			 vjob->handle);
 	fill_attr_in_uint32(cmd, UVERBS_ATTR_JOB_ADDR_REMOVE_INDEX, addr_idx);
-	fill_attr_in_uint32(cmd, UVERBS_ATTR_JOB_ADDR_REMOVE_FLAGS, flags);
 
 	if (execute_ioctl(vjob->context, cmd))
 		return errno;
@@ -325,13 +318,12 @@ static int uet_ref_remove_addr(struct ibv_job *vjob,
 
 static int uet_ref_query_addr(struct ibv_job *vjob,
 			      unsigned int addr_idx,
-			      struct ibv_ah_attr_ex *ah_attr,
-			      unsigned int flags)
+			      struct ibv_ah_attr_ex *ah_attr)
 {
 	struct ib_uverbs_ah_attr_ex uah;
 
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JOB,
-			       UVERBS_METHOD_JOB_ADDR_QUERY, 4);
+			       UVERBS_METHOD_JOB_ADDR_QUERY, 3);
 
 	if (!ah_attr)
 		return EINVAL;
@@ -340,7 +332,6 @@ static int uet_ref_query_addr(struct ibv_job *vjob,
 			 vjob->handle);
 	fill_attr_in_uint32(cmd, UVERBS_ATTR_JOB_ADDR_QUERY_INDEX, addr_idx);
 	fill_attr_out_ptr(cmd, UVERBS_ATTR_JOB_ADDR_QUERY_AH_ATTR_EX, &uah);
-	fill_attr_in_uint32(cmd, UVERBS_ATTR_JOB_ADDR_QUERY_FLAGS, flags);
 
 	if (execute_ioctl(vjob->context, cmd))
 		return errno;
@@ -361,14 +352,13 @@ static int uet_ref_query_addr(struct ibv_job *vjob,
 }
 
 static struct ibv_job_key *uet_ref_create_jkey(struct ibv_pd *pd,
-					       struct ibv_job *vjob,
-					       unsigned int flags)
+					       struct ibv_job *vjob)
 {
 	struct ib_uverbs_attr *handle;
 	struct uet_ref_jkey *jkey;
 
 	DECLARE_COMMAND_BUFFER(cmd, UVERBS_OBJECT_JKEY,
-			       UVERBS_METHOD_JKEY_CREATE, 5);
+			       UVERBS_METHOD_JKEY_CREATE, 4);
 
 	jkey = calloc(1, sizeof(*jkey));
 	if (!jkey)
@@ -379,7 +369,6 @@ static struct ibv_job_key *uet_ref_create_jkey(struct ibv_pd *pd,
 	fill_attr_in_obj(cmd, UVERBS_ATTR_CREATE_JKEY_PD_HANDLE, pd->handle);
 	fill_attr_in_obj(cmd, UVERBS_ATTR_CREATE_JKEY_JOB_HANDLE,
 			 vjob->handle);
-	fill_attr_in_uint32(cmd, UVERBS_ATTR_CREATE_JKEY_FLAGS, flags);
 	fill_attr_out_ptr(cmd, UVERBS_ATTR_CREATE_JKEY_JKEY, &jkey->vjkey.jkey);
 
 	if (execute_ioctl(pd->context, cmd)) {

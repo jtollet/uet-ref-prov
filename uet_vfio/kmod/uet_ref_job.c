@@ -42,7 +42,7 @@ int uet_ref_alloc_job(struct ib_job *ibjob,
 	param[0] = attr->job_id;
 	param[1] = attr->max_addr_entries;
 	param[2] = attr->port_num | ((u64)attr->sgid_index << 8);
-	param[3] = attr->flags;
+	param[3] = 0;
 
 	ret = uet_ref_admin_cmd(dev, UET_DEV_ADMIN_JOB_ALLOC, param,
 				ARRAY_SIZE(param), NULL, 0, result);
@@ -62,7 +62,7 @@ void uet_ref_dealloc_job(struct ib_job *ibjob)
 	int ret;
 
 	/* Nothing above can act on a failure: this runs from the job's last
-	 * reference, or from core revoking it as the device unregisters.
+	 * reference.
 	 */
 	ret = uet_ref_admin_cmd(dev, UET_DEV_ADMIN_JOB_FREE, param, 1, NULL,
 				0, NULL);
@@ -87,7 +87,6 @@ int uet_ref_query_job(struct ib_job *ibjob,
 
 	attr->job_id = le32_to_cpu(info.job_id);
 	attr->max_addr_entries = le32_to_cpu(info.max_addr_entries);
-	attr->flags = le32_to_cpu(info.flags);
 	attr->port_num = info.port_num;
 	attr->sgid_index = info.sgid_index;
 
@@ -159,14 +158,13 @@ static void uet_ref_addr_to_rdma(struct rdma_ah_attr_ex *out_ex,
  */
 int uet_ref_job_addr_insert(struct ib_job *ibjob,
 			    u32 index,
-			    struct rdma_ah_attr_ex *ah_attr,
-			    u32 flags)
+			    struct rdma_ah_attr_ex *ah_attr)
 {
 	struct uet_ref_job *job = to_uet_job(ibjob);
 	struct uet_ref_dev *dev = container_of(ibjob->device,
 					       struct uet_ref_dev, ib_dev);
 	struct uet_dev_admin_addr addr;
-	u64 param[3] = { job->handle, index, flags };
+	u64 param[3] = { job->handle, index, 0 };
 
 	uet_ref_addr_from_rdma(&addr, ah_attr);
 
@@ -176,13 +174,12 @@ int uet_ref_job_addr_insert(struct ib_job *ibjob,
 }
 
 int uet_ref_job_addr_remove(struct ib_job *ibjob,
-			    u32 index,
-			    u32 flags)
+			    u32 index)
 {
 	struct uet_ref_job *job = to_uet_job(ibjob);
 	struct uet_ref_dev *dev = container_of(ibjob->device,
 					       struct uet_ref_dev, ib_dev);
-	u64 param[3] = { job->handle, index, flags };
+	u64 param[3] = { job->handle, index, 0 };
 
 	return uet_ref_admin_cmd(dev, UET_DEV_ADMIN_ADDR_REMOVE, param,
 				 ARRAY_SIZE(param), NULL, 0, NULL);
@@ -190,14 +187,13 @@ int uet_ref_job_addr_remove(struct ib_job *ibjob,
 
 int uet_ref_job_addr_query(struct ib_job *ibjob,
 			   u32 index,
-			   struct rdma_ah_attr_ex *ah_attr,
-			   u32 flags)
+			   struct rdma_ah_attr_ex *ah_attr)
 {
 	struct uet_ref_job *job = to_uet_job(ibjob);
 	struct uet_ref_dev *dev = container_of(ibjob->device,
 					       struct uet_ref_dev, ib_dev);
 	struct uet_dev_admin_addr addr;
-	u64 param[3] = { job->handle, index, flags };
+	u64 param[3] = { job->handle, index, 0 };
 	int ret;
 
 	ret = uet_ref_admin_cmd(dev, UET_DEV_ADMIN_ADDR_QUERY, param,
@@ -215,7 +211,6 @@ int uet_ref_job_addr_query(struct ib_job *ibjob,
 /* ---------------------------------------------------------------- */
 
 int uet_ref_create_jkey(struct ib_jkey *ibjkey,
-			u32 flags,
 			struct uverbs_attr_bundle *attrs)
 {
 	struct uet_ref_jkey *jkey = to_uet_jkey(ibjkey);
@@ -230,7 +225,7 @@ int uet_ref_create_jkey(struct ib_jkey *ibjkey,
 
 	param[0] = job->handle;
 	param[1] = pd->pdn;
-	param[2] = flags;
+	param[2] = 0;
 
 	ret = uet_ref_admin_cmd(dev, UET_DEV_ADMIN_JKEY_CREATE, param,
 				ARRAY_SIZE(param), NULL, 0, result);
