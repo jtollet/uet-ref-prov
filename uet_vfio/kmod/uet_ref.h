@@ -333,15 +333,15 @@ int uet_ref_alloc_job(struct ib_job *ibjob, struct ib_job_attr *attr,
 		      struct uverbs_attr_bundle *attrs);
 void uet_ref_dealloc_job(struct ib_job *ibjob);
 int uet_ref_query_job(struct ib_job *ibjob, struct ib_job_attr *attr);
-int uet_ref_create_jkey(struct ib_jkey *ibjkey, u32 flags,
+int uet_ref_create_jkey(struct ib_jkey *ibjkey,
 			struct uverbs_attr_bundle *attrs);
 int uet_ref_destroy_jkey(struct ib_jkey *ibjkey,
 			 struct uverbs_attr_bundle *attrs);
 int uet_ref_job_addr_insert(struct ib_job *ibjob, u32 index,
-			    struct rdma_ah_attr_ex *ah_attr, u32 flags);
-int uet_ref_job_addr_remove(struct ib_job *ibjob, u32 index, u32 flags);
+			    struct rdma_ah_attr_ex *ah_attr);
+int uet_ref_job_addr_remove(struct ib_job *ibjob, u32 index);
 int uet_ref_job_addr_query(struct ib_job *ibjob, u32 index,
-			   struct rdma_ah_attr_ex *ah_attr, u32 flags);
+			   struct rdma_ah_attr_ex *ah_attr);
 
 /* memory regions: uet_ref_mr.c */
 
