@@ -10,7 +10,9 @@ thread dispatches frames to pinned workers. The sender has eight fixed
 workers and one ACK dispatcher. Its test fixture uses distinct `PIDonFEP`
 values to keep the eight streams on independent PDCs. Both sides use the
 Verbs build of libuet from [RFC #177](https://github.com/ultraethernet/uet-ref-prov/pull/177)
-at `64225fc6be52c41e3705f4b29353ff9a290f30c8`.
+at `2a1d1336cb754ef9b4bec342a69f1c91345771b7`. The sender creates a destination
+handle owned by each context and checks that passing it to a different
+context is rejected.
 
 ## Set up the test
 
@@ -23,7 +25,7 @@ and `ethtool`. The functional test uses `iproute2` and `iptables`.
 git clone --branch rfc/pds-contexts-benchmark --single-branch \
   https://github.com/jtollet/uet-ref-prov.git uet-pds-bench
 cd uet-pds-bench
-git worktree add --detach ../uet-pds-candidate 64225fc6be52c41e3705f4b29353ff9a290f30c8
+git worktree add --detach ../uet-pds-candidate 2a1d1336cb754ef9b4bec342a69f1c91345771b7
 ```
 
 ## Measure over physical Ethernet
@@ -44,7 +46,7 @@ The results path must be new.
 sudo python3 -B bench/pds-contexts/tools/run_two_ip_probe.py \
   --candidate ../uet-pds-candidate --results /tmp/uet-pds-rdma-batch \
   --rdma RX_PORT TX_PORT --rx-cpu 4 --tx-cpu 28 \
-  --parallel-tx --rdma-batch --workers 1 2 4 8 \
+  --parallel-tx --rdma-batch --require-owned-av --workers 1 2 4 8 \
   --iterations 20000 --window 8 --repeat 5
 ```
 
@@ -57,10 +59,11 @@ dispatcher between the first frame and the final receive completion. ACKs
 travel in the opposite direction. A 4 KiB message spans four data frames
 at MTU 1500.
 
-## Results
+## Original worker-pool scaling results
 
-These medians come from five runs per row and polling mode. Both modes
-verified 3.2 million SENDs each using the candidate above.
+These medians come from five runs per row and polling mode at `64225fc`,
+the revision that introduced worker-local pools. Both modes verified
+3.2 million SENDs each.
 
 | RX workers | One completion per poll | Up to 16 completions per poll |
 | ---: | ---: | ---: |
@@ -74,7 +77,43 @@ dispatcher was busy throughout and its queues did not fill. The two JSON
 files contain per-run ownership counts, timings and NIC counters.
 [Single completion](results/rdma-single.json) · [Batch polling](results/rdma-batch.json).
 
-## Verify ownership without RDMA hardware
+## Compare the address ownership change
+
+Build the preceding revision in a second worktree and repeat the physical
+test with a fresh results directory. Use the same launcher, ports, CPUs and
+workload. Pass `--candidate ../uet-pds-baseline` and omit `--require-owned-av`
+for the baseline.
+
+```sh
+git worktree add --detach ../uet-pds-baseline 64225fc6be52c41e3705f4b29353ff9a290f30c8
+```
+
+| RX workers | Baseline RX Mpps | Context-owned address RX Mpps |
+| ---: | ---: | ---: |
+| 1 | 0.3117 | 0.3116 |
+| 2 | 0.6173 | 0.6189 |
+| 4 | 1.2030 | 1.2027 |
+| 8 | 1.3753 | 1.3768 |
+
+The comparison checked 6.4 million SENDs across 40 runs. The median rate
+changed by at most 0.26% across these configurations.
+[Per-run rates and validation results](results/av-ownership.json).
+
+## Check address ownership and retransmission
+
+This veth run uses eight workers at each endpoint. It drops one data frame
+on an established PDC and requires a logged packet retransmission. The
+runner checks all payloads and fails if ThreadSanitizer reports an error.
+Select two disjoint sets of nine CPUs as in the physical test.
+
+```sh
+sudo python3 -B bench/pds-contexts/tools/run_two_ip_probe.py \
+  --candidate ../uet-pds-candidate --results /tmp/uet-pds-av-tsan \
+  --rx-cpu 4 --tx-cpu 28 --workers 8 --parallel-tx --require-owned-av \
+  --drop-established --tsan --iterations 1000 --window 8 --repeat 3
+```
+
+## Run on a small VM
 
 Use a Linux VM with at least four available CPUs and support for network
 namespaces. This run uses a veth pair. Its single-thread sender builds

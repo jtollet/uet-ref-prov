@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 
 from bench_support import Process, build, command, digest, logged, physical_ports, wire_counters
 
@@ -48,6 +49,10 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
                  (tx_role, sender, args.tx_cpu, 8 if args.parallel_tx else workers))
         for side, (role, library, cpu, count) in enumerate(sides):
             proc_env = dict(env, LD_LIBRARY_PATH=str(library))
+            if args.tsan:
+                proc_env["TSAN_OPTIONS"] = "halt_on_error=1:exitcode=66"
+            if args.drop_established and role == "rx":
+                proc_env["SE_DROP_ESTABLISHED"] = "1"
             prefix = ["ip", "netns", "exec", names[side]] if names else []
             if ports:
                 proc_env.update(UET_IFNAME=ports[side]["name"], SE_RDMA_DEVICE=ports[side]["device"],
@@ -73,6 +78,7 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
             raise RuntimeError(f"receiver failed to close in {root.name}")
         assert tx_result["messages"] == 8 * args.iterations
         assert rx_result["pdc_count"] == rx_result["established_count"] == 8
+        assert rx_result["dropped_frames"] == int(args.drop_established)
         assert rx_result["dispatch_cpu_ns"] > 0 and rx_result["dispatch_wall_ns"] > 0
         assert len(rx_result["owners"]) == workers
         for owner in rx_result["owners"]:
@@ -81,6 +87,16 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
                    for i in range(8))
         result = {"workers": workers, "receiver_library_mappings": mappings,
                   "tx": tx_result, "rx": rx_result}
+        tx_log = (root / f"{tx_role}.log").read_text()
+        rx_log = (root / "rx.log").read_text()
+        result["owned_av_checks"] = "SE_AV_OWNERSHIP_OK" in tx_log
+        assert not args.require_owned_av or result["owned_av_checks"]
+        if args.tsan:
+            result["sanitizer_reports"] = (tx_log + rx_log).count("ThreadSanitizer:")
+            assert result["sanitizer_reports"] == 0
+        if args.drop_established:
+            result["tx_retransmissions"] = len(re.findall(r"PSN \d+ retransmit\b", tx_log))
+            assert result["tx_retransmissions"] > 0
         if ports:
             after = [wire_counters(p) for p in ports]
             result["physical_packets"] = [{k: y[k] - x[k] for k in x} for x, y in zip(before, after)]
@@ -101,8 +117,11 @@ def main():
     parser.add_argument("--workers", nargs="+", type=int, default=[1, 2, 4, 8])
     parser.add_argument("--rx-cpu", type=int, required=True, help="dispatcher CPU, followed by worker CPUs")
     parser.add_argument("--tx-cpu", type=int, required=True)
-    parser.add_argument("--parallel-tx", action="store_true", help="use eight fixed sender workers and an ACK dispatcher for RDMA")
+    parser.add_argument("--parallel-tx", action="store_true", help="use eight fixed sender workers and an ACK dispatcher")
     parser.add_argument("--rdma-batch", action="store_true", help="poll and repost up to 16 RDMA RX buffers at once")
+    parser.add_argument("--tsan", action="store_true", help="instrument both the library and the test")
+    parser.add_argument("--drop-established", action="store_true", help="drop one data frame on an established PDC")
+    parser.add_argument("--require-owned-av", action="store_true", help="require the scoped address ownership checks")
     parser.add_argument("--functional-worker-cpus", type=int,
                         help="let test workers share CPUs for functional validation in a small VM")
     parser.add_argument("--iterations", type=int, default=2000)
@@ -113,8 +132,10 @@ def main():
         parser.error("Linux and root are required")
     if any(w not in (1, 2, 4, 8) for w in args.workers) or len(set(args.workers)) != len(args.workers):
         parser.error("select distinct worker counts from 1, 2, 4 and 8")
-    if (args.parallel_tx or args.rdma_batch) and not args.rdma:
-        parser.error("the parallel load generator and batch polling require RDMA")
+    if args.rdma_batch and not args.rdma:
+        parser.error("batch polling requires RDMA")
+    if args.require_owned_av and not args.parallel_tx:
+        parser.error("the address ownership checks require parallel TX")
     if args.functional_worker_cpus is not None:
         if args.rdma or not 1 <= args.functional_worker_cpus <= max(args.workers):
             parser.error("shared CPUs are available only in the functional veth test")
@@ -134,22 +155,27 @@ def main():
     root.mkdir(mode=0o700)
     fixture_dir = Path(__file__).resolve().parent
     source_patch = fixture_dir.parent / "patches" / "pds-init-source-pid.patch"
+    sanitizer = ["-fsanitize=thread", "-O1", "-fno-omit-frame-pointer"] if args.tsan else []
     receiver = root / "receiver"
-    build(receiver, args.candidate.resolve(), [])
+    build(receiver, args.candidate.resolve(), [], sanitizer)
     if args.parallel_tx:
         sender = receiver
     else:
         sender = root / "sender"
-        build(sender, args.reference.resolve(), [source_patch])
+        build(sender, args.reference.resolve(), [source_patch], sanitizer)
     fixture, rdma, binary = fixture_dir / "shared_endpoint_two_ip.c", fixture_dir / "shared_endpoint_rdma.c", root / "traffic"
     mode = ["-DSE_USE_RDMA", "-Wno-address-of-packed-member", rdma, "-libverbs"] if args.rdma else []
     if args.rdma_batch:
         mode.insert(0, "-DSE_BATCH_RDMA")
+    if args.parallel_tx:
+        mode.insert(0, "-DSE_PARALLEL_TX")
     logged(["gcc", "-Wall", "-Wextra", "-Werror", "-O2", "-g", "-DENABLE_VERBS=1",
+            *sanitizer,
             "-I", receiver, "-I", receiver / "nic_shim", "-I", receiver / "util",
             "-isystem", receiver / "libfabric_headers", "-isystem", receiver / "libfabric_headers/include",
             fixture, *mode, "-L", receiver, "-luet_verbs", "-pthread", "-ldl", "-o", binary], root / "fixture-build.log")
     summary = {"arch": platform.machine(), "mode": "rdma" if args.rdma else "veth functional",
+               "tsan": args.tsan,
                "iterations_per_pdc": args.iterations, "window": args.window, "rx_cpus": rx_cpus,
                "tx_cpus": tx_cpus, "tx_workers": 8 if args.parallel_tx else 1,
                "sender_patch_sha256": None if args.parallel_tx else digest(source_patch),

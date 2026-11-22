@@ -1,0 +1,287 @@
+{
+  "baseline": "64225fc6be52c41e3705f4b29353ff9a290f30c8",
+  "candidate": "2a1d1336cb754ef9b4bec342a69f1c91345771b7",
+  "validation": {
+    "strict_core_fabric_and_verbs": "pass",
+    "vfio": {
+      "ordinary_qps": true,
+      "guests": 2,
+      "workers_per_device": 1,
+      "message_bytes": 4096,
+      "send_recv_iterations": 100,
+      "rma_iterations": 100,
+      "result": "pass"
+    },
+    "thread_sanitizer": {
+      "architecture": "x86_64",
+      "sends": 24000,
+      "rx_workers": 8,
+      "tx_workers": 8,
+      "pdcs": 8,
+      "runs": [
+        {
+          "dropped_frames": 1,
+          "tx_retransmissions": 4,
+          "owned_av_checks": true,
+          "sanitizer_reports": 0
+        },
+        {
+          "dropped_frames": 1,
+          "tx_retransmissions": 4,
+          "owned_av_checks": true,
+          "sanitizer_reports": 0
+        },
+        {
+          "dropped_frames": 1,
+          "tx_retransmissions": 4,
+          "owned_av_checks": true,
+          "sanitizer_reports": 0
+        }
+      ]
+    }
+  },
+  "rdma": {
+    "transport": "raw Ethernet QPs on two directly cabled ConnectX-5 Ex ports",
+    "poll_batch_limit": 16,
+    "message_bytes": 4096,
+    "fixed_pdcs": 8,
+    "verified_sends": 6400000,
+    "fixture_sha256": "664558b595b396980cc97c6a3a17fc360e20bdf79117b6b2bdb9cb4b71191d8d",
+    "rdma_sha256": "50892fe96544bdee18f1f05872741204d4bdba9da80869720778052ec93c5d9c",
+    "rdma_rx_header_sha256": "9407168a24200adeca1881bb8898b01721809dabf1d769df71160ef5ecdd3675",
+    "rx_cpus": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12
+    ],
+    "tx_cpus": [
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "port_speeds_mbps": [
+      100000,
+      100000
+    ],
+    "iterations_per_pdc": 20000,
+    "window": 8,
+    "configurations": [
+      {
+        "workers": 1,
+        "baseline": {
+          "rx_mpps": [
+            0.31167,
+            0.311707,
+            0.311805,
+            0.312003,
+            0.311664
+          ],
+          "median_rx_mpps": 0.311707,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640005,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        },
+        "candidate": {
+          "rx_mpps": [
+            0.310655,
+            0.310906,
+            0.311559,
+            0.311887,
+            0.311556
+          ],
+          "median_rx_mpps": 0.311556,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640004,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        }
+      },
+      {
+        "workers": 2,
+        "baseline": {
+          "rx_mpps": [
+            0.616372,
+            0.617313,
+            0.618701,
+            0.617836,
+            0.615329
+          ],
+          "median_rx_mpps": 0.617313,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640000,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        },
+        "candidate": {
+          "rx_mpps": [
+            0.615864,
+            0.619806,
+            0.618924,
+            0.618879,
+            0.617901
+          ],
+          "median_rx_mpps": 0.618879,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640002,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        }
+      },
+      {
+        "workers": 4,
+        "baseline": {
+          "rx_mpps": [
+            1.199133,
+            1.202638,
+            1.202965,
+            1.203452,
+            1.20388
+          ],
+          "median_rx_mpps": 1.202965,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640000,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        },
+        "candidate": {
+          "rx_mpps": [
+            1.20274,
+            1.198825,
+            1.203609,
+            1.205917,
+            1.19526
+          ],
+          "median_rx_mpps": 1.20274,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640000,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        }
+      },
+      {
+        "workers": 8,
+        "baseline": {
+          "rx_mpps": [
+            1.378448,
+            1.375256,
+            1.371506,
+            1.377571,
+            1.37361
+          ],
+          "median_rx_mpps": 1.375256,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640000,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        },
+        "candidate": {
+          "rx_mpps": [
+            1.376426,
+            1.386793,
+            1.377129,
+            1.369844,
+            1.376786
+          ],
+          "median_rx_mpps": 1.376786,
+          "rx_dispatch_queue_waits": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "physical_rx_frames": [
+            640000,
+            640000,
+            640000,
+            640000,
+            640000
+          ]
+        }
+      }
+    ]
+  }
+}

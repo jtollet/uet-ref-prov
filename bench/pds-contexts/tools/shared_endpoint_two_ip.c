@@ -16,8 +16,10 @@
 #include <time.h>
 #include <uet_api.h>
 #include <uet_pkt_hdr.h>
-#ifdef SE_USE_RDMA
+#ifdef SE_PARALLEL_TX
 #include <uet_api_private.h>
+#endif
+#ifdef SE_USE_RDMA
 #include "shared_endpoint_rdma.h"
 #endif
 #include <unistd.h>
@@ -136,6 +138,7 @@ static struct worker {
 
 static uint64_t dispatch_frames, dispatch_wall_ns, dispatch_cpu_ns, queue_waits;
 static unsigned pdc_count, established_count;
+static bool drop_established, dropped_frame;
 static int pdc_owner[UINT16_MAX + 1];
 static uint16_t destination_pdc[UINT16_MAX + 1];
 
@@ -201,6 +204,11 @@ dispatch (void *arg)
                 {
                   uint16_t dpdcid = ntohs (hdr->dpdcid);
                   assert (dpdcid / 64 == owner && dpdcid % 64);
+                  if (drop_established && !dropped_frame && destination_pdc[id])
+                    {
+                      dropped_frame = true;
+                      continue;
+                    }
                   if (!destination_pdc[id])
                     established_count++;
                   else
@@ -338,9 +346,9 @@ run_receiver (uet_domain_handle_t domain, struct fi_info *info, unsigned first_c
   for (unsigned i = 0; i < workers; i++)
     check (pthread_join (receiver[i], NULL), "join RX worker");
   assert (pdc_count == FLOWS && established_count == FLOWS);
-  printf ("SE_RX {\"pdc_count\":%u,\"established_count\":%u,\"dispatch_frames\":%llu,"
+  printf ("SE_RX {\"pdc_count\":%u,\"established_count\":%u,\"dropped_frames\":%u,\"dispatch_frames\":%llu,"
           "\"dispatch_wall_ns\":%llu,\"dispatch_cpu_ns\":%llu,\"queue_waits\":%llu,\"owners\":[",
-          pdc_count, established_count, (unsigned long long) dispatch_frames,
+          pdc_count, established_count, (unsigned) dropped_frame, (unsigned long long) dispatch_frames,
           (unsigned long long) dispatch_wall_ns,
           (unsigned long long) dispatch_cpu_ns, (unsigned long long) queue_waits);
   for (unsigned i = 0; i < workers; i++)
@@ -439,7 +447,7 @@ run_sender (uet_domain_handle_t domain, struct fi_info *info, unsigned cpu)
   free (flow);
 }
 
-#ifdef SE_USE_RDMA
+#ifdef SE_PARALLEL_TX
 static struct sender tx_flows[FLOWS];
 static atomic_bool start_tx;
 
@@ -449,7 +457,9 @@ send_parallel (void *arg)
   struct worker *w = arg;
   struct sender *f = &tx_flows[w->index];
   pin (w->cpu);
+#ifdef SE_USE_RDMA
   physical_select_worker_tx (w->index);
+#endif
   while (!atomic_load_explicit (&start_tx, memory_order_acquire))
     ;
   uint64_t start = now (CLOCK_THREAD_CPUTIME_ID);
@@ -474,8 +484,10 @@ run_parallel_sender (uet_domain_handle_t domain, struct fi_info *info, unsigned 
   assert (workers == FLOWS);
   check (uet_endpoint (domain, info, NULL, NULL, &parent, 10, 200, 2000,
                        JOB, false, false, 0), "create sender parent");
-  ingress = physical_open (destination.fa.v4);
+  ingress = open_ingress (destination.fa.v4);
   pthread_t sender[FLOWS], dispatcher;
+  int (*insert_context_av) (uet_ep_handle_t, struct uet_addr *, uet_addr_handle_t *) =
+    dlsym (RTLD_DEFAULT, "uet_ep_context_av_insert");
   for (unsigned i = 0; i < FLOWS; i++)
     {
       struct sender *f = &tx_flows[i];
@@ -486,18 +498,35 @@ run_parallel_sender (uet_domain_handle_t domain, struct fi_info *info, unsigned 
       struct uet_ep *ep = f->ep;
       ep->uet_addr.pid_on_fep = 10 + i;
       ep->uet_addr.initiator_id = 2000 + i;
-      check (uet_av_insert (domain, &destination, &f->address), "insert context destination");
+      if (insert_context_av)
+        check (insert_context_av (f->ep, &destination, &f->address), "insert owned destination");
+      else
+        check (uet_av_insert (domain, &destination, &f->address), "insert context destination");
       check (uet_ep_bind_cq (f->ep, &cq_attr, NULL, FI_SEND, NULL, &f->cq), "bind context TX");
       w->ep = f->ep;
       w->index = i;
       w->cpu = first_cpu + i + 1;
+#ifdef SE_USE_RDMA
       physical_open_worker_tx (i);
+#endif
     }
   for (unsigned i = 0; i < FLOWS; i++)
+    check (uet_ep_enable (tx_flows[i].ep), "enable sender context");
+  if (insert_context_av)
     {
-      check (uet_ep_enable (tx_flows[i].ep), "enable sender context");
-      check (pthread_create (&sender[i], NULL, send_parallel, &rx_workers[i]), "start sender worker");
+      struct sender *f = &tx_flows[1];
+      uet_addr_handle_t shared = tx_flows[0].address, unbound;
+      struct iovec iov = { .iov_base = f->buffers[0], .iov_len = sizeof (f->buffers[0]) };
+      assert (uet_ep_close (f->ep) == -FI_EBUSY);
+      assert (insert_context_av (f->ep, &destination, &unbound) == -FI_EBUSY);
+      assert (uet_sendv (f->ep, JOB, &iov, 1, NULL, shared, NULL, RX_RI) == -FI_EINVAL);
+      check (uet_av_insert (domain, &destination, &unbound), "insert unbound destination");
+      assert (uet_sendv (f->ep, JOB, &iov, 1, NULL, unbound, NULL, RX_RI) == -FI_EINVAL);
+      check (uet_av_remove (unbound), "remove unbound destination");
+      puts ("SE_AV_OWNERSHIP_OK");
     }
+  for (unsigned i = 0; i < FLOWS; i++)
+    check (pthread_create (&sender[i], NULL, send_parallel, &rx_workers[i]), "start sender worker");
   check (pthread_create (&dispatcher, NULL, dispatch, &first_cpu), "start ACK dispatcher");
   puts ("SE_READY");
   wait_command ("go");
@@ -519,10 +548,13 @@ run_parallel_sender (uet_domain_handle_t domain, struct fi_info *info, unsigned 
           (unsigned long long) dispatch_cpu_ns, (unsigned long long) queue_waits);
   for (unsigned i = 0; i < FLOWS; i++)
     {
-      check (uet_ep_close (tx_flows[i].ep), "close sender context");
       check (uet_av_remove (tx_flows[i].address), "remove context destination");
+      check (uet_ep_close (tx_flows[i].ep), "close sender context");
     }
   check (uet_ep_close (parent), "close sender parent");
+#ifndef SE_USE_RDMA
+  close (ingress);
+#endif
 }
 #endif
 
@@ -531,6 +563,7 @@ main (int argc, char **argv)
 {
   assert (argc == 7);
   bool sender = !strcmp (argv[1], "tx");
+  drop_established = getenv ("SE_DROP_ESTABLISHED") != NULL;
   iterations = atoi (argv[2]);
   window = atoi (argv[3]);
   workers = atoi (argv[4]);
@@ -548,7 +581,7 @@ main (int argc, char **argv)
   info->tx_attr->op_flags = info->rx_attr->op_flags = FI_COMPLETION;
   info->tx_attr->msg_order = FI_ORDER_SAS;
   check (uet_domain (instance, NULL, info, NULL, NULL, NULL, NULL, &domain), "create domain");
-#ifdef SE_USE_RDMA
+#ifdef SE_PARALLEL_TX
   if (!strcmp (argv[1], "parallel-tx"))
     run_parallel_sender (domain, info, cpu);
   else
