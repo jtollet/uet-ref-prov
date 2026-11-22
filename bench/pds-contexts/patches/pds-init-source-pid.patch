@@ -1,0 +1,18 @@
+--- a/uet_pds.c
++++ b/uet_pds.c
+@@ -156,6 +156,7 @@
+ struct uet_pdc_ini_key {
+ 	pdc_type_t    type;
+ 	uint32_t      job_id;
++	uint16_t      src_pid_on_fep;
+ 	struct uet_fa src_ip;
+ 	struct uet_fa dst_ip;
+ 	uint8_t       tc;
+@@ -966,6 +967,7 @@
+ 			(mode == UET_PDS_MODE_RUD) ? PDC_TYPE_RUD :
+ 						     PDC_TYPE_NONE);
+ 	pdc_key.job_id = uet_ep->job_id;
++	pdc_key.src_pid_on_fep = uet_ep->uet_addr.pid_on_fep;
+ 	pdc_key.tc = UET_DEFAULT_TC;
+ 	memcpy(&pdc_key.src_ip, &local_ip, sizeof(struct uet_fa));
+ 	memcpy(&pdc_key.dst_ip, &av_entry->addr->fa, sizeof(struct uet_fa));

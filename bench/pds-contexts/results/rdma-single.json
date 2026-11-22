@@ -1,0 +1,1825 @@
+{
+  "arch": "x86_64",
+  "mode": "rdma",
+  "iterations_per_pdc": 20000,
+  "window": 8,
+  "rx_cpus": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12
+  ],
+  "tx_cpus": [
+    28,
+    29,
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+  ],
+  "tx_workers": 8,
+  "sender_patch_sha256": null,
+  "fixture_sha256": "3bb8ed336161342fb79df79b987160bd02184b75170c8f03588b9d3106034f13",
+  "cases": [
+    {
+      "workers": 1,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778009861691173,
+        "elapsed_ns": 2049743520,
+        "cpu_ns": 16393150054,
+        "ack_dispatch_wall_ns": 2049268004,
+        "ack_dispatch_cpu_ns": 2049234869,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 2049363924,
+        "dispatch_cpu_ns": 2049335099,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 640000,
+            "done_ns": 3778011911285360,
+            "messages": [
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640005,
+          "tx_packets_phy": 160029
+        },
+        {
+          "rx_packets_phy": 160029,
+          "tx_packets_phy": 640005
+        }
+      ]
+    },
+    {
+      "workers": 2,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778012101171157,
+        "elapsed_ns": 1035036906,
+        "cpu_ns": 8273760466,
+        "ack_dispatch_wall_ns": 1034609171,
+        "ack_dispatch_cpu_ns": 1034590823,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 1034764476,
+        "dispatch_cpu_ns": 1034745119,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 320000,
+            "done_ns": 3778013135050589,
+            "messages": [
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 320000,
+            "done_ns": 3778013136151910,
+            "messages": [
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640001,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640001
+        }
+      ]
+    },
+    {
+      "workers": 4,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778013334409644,
+        "elapsed_ns": 537468898,
+        "cpu_ns": 4291496589,
+        "ack_dispatch_wall_ns": 537011668,
+        "ack_dispatch_cpu_ns": 536982079,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 537202323,
+        "dispatch_cpu_ns": 537190713,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 160000,
+            "done_ns": 3778013870735405,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 160000,
+            "done_ns": 3778013871818742,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 160000,
+            "done_ns": 3778013871634117,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 160000,
+            "done_ns": 3778013869581221,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 8,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778014075122374,
+        "elapsed_ns": 502363265,
+        "cpu_ns": 4010489316,
+        "ack_dispatch_wall_ns": 501813883,
+        "ack_dispatch_cpu_ns": 501808640,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 502082471,
+        "dispatch_cpu_ns": 502050048,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 80000,
+            "done_ns": 3778014575172661,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 80000,
+            "done_ns": 3778014575720820,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 80000,
+            "done_ns": 3778014576729716,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 80000,
+            "done_ns": 3778014576110114,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 9,
+            "frames": 80000,
+            "done_ns": 3778014576643439,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 10,
+            "frames": 80000,
+            "done_ns": 3778014577096108,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 11,
+            "frames": 80000,
+            "done_ns": 3778014577419505,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 12,
+            "frames": 80000,
+            "done_ns": 3778014576967222,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 8,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778014791123741,
+        "elapsed_ns": 502669248,
+        "cpu_ns": 4012608050,
+        "ack_dispatch_wall_ns": 502122013,
+        "ack_dispatch_cpu_ns": 500905003,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 502404033,
+        "dispatch_cpu_ns": 502398311,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 80000,
+            "done_ns": 3778015290885590,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 80000,
+            "done_ns": 3778015292045579,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 80000,
+            "done_ns": 3778015292733160,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 80000,
+            "done_ns": 3778015292520129,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 9,
+            "frames": 80000,
+            "done_ns": 3778015292935966,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 10,
+            "frames": 80000,
+            "done_ns": 3778015293744888,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 11,
+            "frames": 80000,
+            "done_ns": 3778015293442627,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 12,
+            "frames": 80000,
+            "done_ns": 3778015293466467,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 4,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778015506139213,
+        "elapsed_ns": 537691973,
+        "cpu_ns": 4288633641,
+        "ack_dispatch_wall_ns": 537162755,
+        "ack_dispatch_cpu_ns": 537153024,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 537339435,
+        "dispatch_cpu_ns": 537295830,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 160000,
+            "done_ns": 3778016042107939,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 160000,
+            "done_ns": 3778016041255473,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 160000,
+            "done_ns": 3778016042226403,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 160000,
+            "done_ns": 3778016043707067,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 2,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778016242841679,
+        "elapsed_ns": 1036078784,
+        "cpu_ns": 8279545126,
+        "ack_dispatch_wall_ns": 1035687715,
+        "ack_dispatch_cpu_ns": 1035594157,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 1035790565,
+        "dispatch_cpu_ns": 1035769140,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 320000,
+            "done_ns": 3778017277277506,
+            "messages": [
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 320000,
+            "done_ns": 3778017278803933,
+            "messages": [
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 1,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778017477648509,
+        "elapsed_ns": 2051714352,
+        "cpu_ns": 16410139286,
+        "ack_dispatch_wall_ns": 2051352741,
+        "ack_dispatch_cpu_ns": 2051141403,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 2051465662,
+        "dispatch_cpu_ns": 2051305599,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 640000,
+            "done_ns": 3778019529322068,
+            "messages": [
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 1,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778019718935981,
+        "elapsed_ns": 2047518039,
+        "cpu_ns": 16376483757,
+        "ack_dispatch_wall_ns": 2047078106,
+        "ack_dispatch_cpu_ns": 2046747405,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 2047176792,
+        "dispatch_cpu_ns": 2046857872,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 640000,
+            "done_ns": 3778021766332277,
+            "messages": [
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 2,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778021959610840,
+        "elapsed_ns": 1034092718,
+        "cpu_ns": 8261682698,
+        "ack_dispatch_wall_ns": 1033610855,
+        "ack_dispatch_cpu_ns": 1033509866,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 1033737901,
+        "dispatch_cpu_ns": 1033592533,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 320000,
+            "done_ns": 3778022991641708,
+            "messages": [
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 320000,
+            "done_ns": 3778022993574218,
+            "messages": [
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 4,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778023187369881,
+        "elapsed_ns": 535150898,
+        "cpu_ns": 4269668442,
+        "ack_dispatch_wall_ns": 534664392,
+        "ack_dispatch_cpu_ns": 534507214,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 534824443,
+        "dispatch_cpu_ns": 534794065,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 160000,
+            "done_ns": 3778023720389265,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 160000,
+            "done_ns": 3778023722391612,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 160000,
+            "done_ns": 3778023721220568,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 160000,
+            "done_ns": 3778023720414814,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 8,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778023925233864,
+        "elapsed_ns": 502348623,
+        "cpu_ns": 4008972840,
+        "ack_dispatch_wall_ns": 501919745,
+        "ack_dispatch_cpu_ns": 501860350,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 502106767,
+        "dispatch_cpu_ns": 502036087,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 80000,
+            "done_ns": 3778024423714376,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 80000,
+            "done_ns": 3778024425614288,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 80000,
+            "done_ns": 3778024426208584,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 80000,
+            "done_ns": 3778024426437863,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 9,
+            "frames": 80000,
+            "done_ns": 3778024426991205,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 10,
+            "frames": 80000,
+            "done_ns": 3778024427538496,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 11,
+            "frames": 80000,
+            "done_ns": 3778024427274432,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 12,
+            "frames": 80000,
+            "done_ns": 3778024427182514,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 8,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778024629190990,
+        "elapsed_ns": 505400708,
+        "cpu_ns": 4033744112,
+        "ack_dispatch_wall_ns": 504981126,
+        "ack_dispatch_cpu_ns": 504919819,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 505158218,
+        "dispatch_cpu_ns": 505105637,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 80000,
+            "done_ns": 3778025131844119,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 80000,
+            "done_ns": 3778025132790072,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 80000,
+            "done_ns": 3778025133591678,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 80000,
+            "done_ns": 3778025132909154,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 9,
+            "frames": 80000,
+            "done_ns": 3778025133619165,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 10,
+            "frames": 80000,
+            "done_ns": 3778025134545601,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 11,
+            "frames": 80000,
+            "done_ns": 3778025134154065,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 12,
+            "frames": 80000,
+            "done_ns": 3778025134063514,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 4,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778025342332254,
+        "elapsed_ns": 538619555,
+        "cpu_ns": 4303319176,
+        "ack_dispatch_wall_ns": 538099330,
+        "ack_dispatch_cpu_ns": 536736009,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 538277362,
+        "dispatch_cpu_ns": 538235217,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 160000,
+            "done_ns": 3778025880759806,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 160000,
+            "done_ns": 3778025880827893,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 160000,
+            "done_ns": 3778025880313296,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 160000,
+            "done_ns": 3778025879585884,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 2,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778026082199809,
+        "elapsed_ns": 1034722898,
+        "cpu_ns": 8266844410,
+        "ack_dispatch_wall_ns": 1034295092,
+        "ack_dispatch_cpu_ns": 1034237006,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 1034388323,
+        "dispatch_cpu_ns": 1034172422,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 320000,
+            "done_ns": 3778027114871405,
+            "messages": [
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 320000,
+            "done_ns": 3778027116797067,
+            "messages": [
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 1,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778027310409305,
+        "elapsed_ns": 2053506950,
+        "cpu_ns": 16421408611,
+        "ack_dispatch_wall_ns": 2052671618,
+        "ack_dispatch_cpu_ns": 2052212724,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 2052787779,
+        "dispatch_cpu_ns": 2052574764,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 640000,
+            "done_ns": 3778029363399095,
+            "messages": [
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 1,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778029560390180,
+        "elapsed_ns": 2057445712,
+        "cpu_ns": 16456438239,
+        "ack_dispatch_wall_ns": 2057104651,
+        "ack_dispatch_cpu_ns": 2056494518,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 2057193692,
+        "dispatch_cpu_ns": 2056975786,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 640000,
+            "done_ns": 3778031617794232,
+            "messages": [
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000,
+              20000
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 2,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778031812997421,
+        "elapsed_ns": 1037248371,
+        "cpu_ns": 8292736390,
+        "ack_dispatch_wall_ns": 1036794872,
+        "ack_dispatch_cpu_ns": 1036705225,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 1036910202,
+        "dispatch_cpu_ns": 1036704385,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 320000,
+            "done_ns": 3778032849627130,
+            "messages": [
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 320000,
+            "done_ns": 3778032850129134,
+            "messages": [
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0,
+              20000,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 4,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778033043737785,
+        "elapsed_ns": 534159163,
+        "cpu_ns": 4267921517,
+        "ack_dispatch_wall_ns": 533648180,
+        "ack_dispatch_cpu_ns": 533638076,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 533807149,
+        "dispatch_cpu_ns": 533740338,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 160000,
+            "done_ns": 3778033577771911,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 160000,
+            "done_ns": 3778033577218908,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 160000,
+            "done_ns": 3778033577369140,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 160000,
+            "done_ns": 3778033576689499,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    },
+    {
+      "workers": 8,
+      "receiver_library_mappings": 1,
+      "tx": {
+        "messages": 160000,
+        "start_ns": 3778033778018808,
+        "elapsed_ns": 507794327,
+        "cpu_ns": 4054211283,
+        "ack_dispatch_wall_ns": 507315588,
+        "ack_dispatch_cpu_ns": 507168742,
+        "ack_queue_waits": 0
+      },
+      "rx": {
+        "pdc_count": 8,
+        "established_count": 8,
+        "dispatch_frames": 640000,
+        "dispatch_wall_ns": 507501696,
+        "dispatch_cpu_ns": 507398042,
+        "queue_waits": 0,
+        "owners": [
+          {
+            "cpu": 5,
+            "frames": 80000,
+            "done_ns": 3778034282605676,
+            "messages": [
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 6,
+            "frames": 80000,
+            "done_ns": 3778034284351963,
+            "messages": [
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 7,
+            "frames": 80000,
+            "done_ns": 3778034284947756,
+            "messages": [
+              0,
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 8,
+            "frames": 80000,
+            "done_ns": 3778034284805078,
+            "messages": [
+              20000,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 9,
+            "frames": 80000,
+            "done_ns": 3778034285400348,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000
+            ]
+          },
+          {
+            "cpu": 10,
+            "frames": 80000,
+            "done_ns": 3778034285757048,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0
+            ]
+          },
+          {
+            "cpu": 11,
+            "frames": 80000,
+            "done_ns": 3778034285470559,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0
+            ]
+          },
+          {
+            "cpu": 12,
+            "frames": 80000,
+            "done_ns": 3778034285470275,
+            "messages": [
+              0,
+              0,
+              0,
+              0,
+              20000,
+              0,
+              0,
+              0
+            ]
+          }
+        ]
+      },
+      "physical_packets": [
+        {
+          "rx_packets_phy": 640000,
+          "tx_packets_phy": 160024
+        },
+        {
+          "rx_packets_phy": 160024,
+          "tx_packets_phy": 640000
+        }
+      ]
+    }
+  ],
+  "rdma_sha256": "50892fe96544bdee18f1f05872741204d4bdba9da80869720778052ec93c5d9c",
+  "rdma_rx_header_sha256": "9407168a24200adeca1881bb8898b01721809dabf1d769df71160ef5ecdd3675",
+  "rdma_batch": false,
+  "port_speeds_mbps": [
+    100000,
+    100000
+  ]
+}
