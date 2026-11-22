@@ -1,0 +1,76 @@
+{
+  "candidate_commit": "6b39300d00811d29345a7e6e968012e441a53b89",
+  "link": "two directly cabled 100 GbE ConnectX-5 Ex Ethernet ports; raw Ethernet queues via libibverbs",
+  "physical_rx": {
+    "fixed_sender_workers": 8,
+    "independent_pdcs": 8,
+    "messages": 3200000,
+    "mpps_by_receiver_workers": {
+      "1": {
+        "samples": [
+          0.3116,
+          0.3121,
+          0.3124,
+          0.3121,
+          0.312
+        ],
+        "median": 0.3121
+      },
+      "2": {
+        "samples": [
+          0.6197,
+          0.6196,
+          0.62,
+          0.6196,
+          0.6189
+        ],
+        "median": 0.6196
+      },
+      "4": {
+        "samples": [
+          1.2073,
+          1.1995,
+          1.1956,
+          1.2042,
+          1.2013
+        ],
+        "median": 1.2013
+      },
+      "8": {
+        "samples": [
+          1.3631,
+          1.3736,
+          1.3732,
+          1.3787,
+          1.3821
+        ],
+        "median": 1.3736
+      }
+    }
+  },
+  "functional_veth": {
+    "late_recv": {
+      "runs": 3,
+      "messages": 24000,
+      "no_match_responses": 24,
+      "unexpected_messages": 24,
+      "thread_sanitizer_reports": 0
+    },
+    "one_dropped_data_frame": {
+      "runs": 3,
+      "messages": 24000,
+      "packet_retransmissions": 12,
+      "thread_sanitizer_reports": 0
+    },
+    "retry_exhaustion": {
+      "runs": 1,
+      "completion": "FI_EIO",
+      "thread_sanitizer_reports": 0
+    }
+  },
+  "additional_checks": {
+    "strict_core": "pass",
+    "vfio_two_qemu_guests": "4 KiB SEND/RECV and RMA, 100 iterations each, pass",
+    "address_sanitizer_finalize": "pass, no leaks"
+  }
+}

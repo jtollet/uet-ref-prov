@@ -42,6 +42,8 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
     env = {key: val for key, val in os.environ.items() if not key.startswith(("UET_", "LD_"))}
     env.update(UET_PDS="pds", UET_NIC_SHIM="rawsock", UET_IFNAME="se0",
                UET_PDS_TX_TIMEOUT="50", UET_PDS_MAX_TX_RETRIES="50")
+    if args.exhaust_retries:
+        env.update(UET_PDS_TX_TIMEOUT="20", UET_PDS_MAX_TX_RETRIES="1")
     processes = []
     try:
         tx_role = "parallel-tx" if args.parallel_tx else "tx"
@@ -53,6 +55,10 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
                 proc_env["TSAN_OPTIONS"] = "halt_on_error=1:exitcode=66"
             if args.drop_established and role == "rx":
                 proc_env["SE_DROP_ESTABLISHED"] = "1"
+            if args.exhaust_retries and role == "rx":
+                proc_env["SE_DROP_ALL_DATA"] = "1"
+            if args.late_recv and role == "rx":
+                proc_env["SE_LATE_RECV"] = "1"
             prefix = ["ip", "netns", "exec", names[side]] if names else []
             if ports:
                 proc_env.update(UET_IFNAME=ports[side]["name"], SE_RDMA_DEVICE=ports[side]["device"],
@@ -69,6 +75,17 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
         assert mappings == 1
         before = [wire_counters(p) for p in ports] if ports else []
         tx.send("go")
+        if args.exhaust_retries:
+            assert tx.wait("completion error failed: -5", timeout=10) is not None
+            assert tx.process.wait(timeout=2) == 1
+            tx_log = (root / f"{tx_role}.log").read_text()
+            rx_log = (root / "rx.log").read_text()
+            assert "max retries exceeded" in tx_log
+            assert not any(term in tx_log + rx_log
+                           for term in ("AddressSanitizer:", "ThreadSanitizer:", "Segmentation fault"))
+            result = {"workers": workers, "retry_exhaustion": "FI_EIO", "sanitizer_reports": 0}
+            (root / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+            return result
         tx_result = json.loads(tx.wait("SE_TX", timeout=38))
         if tx.wait("SE_CLOSED", timeout=20) is None or tx.process.wait(timeout=2):
             raise RuntimeError(f"initiator failed to close in {root.name}")
@@ -97,6 +114,10 @@ def run_case(root, binary, receiver, sender, args, workers, ports, names):
         if args.drop_established:
             result["tx_retransmissions"] = len(re.findall(r"PSN \d+ retransmit\b", tx_log))
             assert result["tx_retransmissions"] > 0
+        if args.late_recv:
+            result["tx_no_match"] = tx_log.count("Msg Rsp: No Match")
+            result["rx_unexpected"] = rx_log.count("RX: Unexpected Message")
+            assert result["tx_no_match"] == result["rx_unexpected"] == workers
         if ports:
             after = [wire_counters(p) for p in ports]
             result["physical_packets"] = [{k: y[k] - x[k] for k in x} for x, y in zip(before, after)]
@@ -121,6 +142,8 @@ def main():
     parser.add_argument("--rdma-batch", action="store_true", help="poll and repost up to 16 RDMA RX buffers at once")
     parser.add_argument("--tsan", action="store_true", help="instrument both the library and the test")
     parser.add_argument("--drop-established", action="store_true", help="drop one data frame on an established PDC")
+    parser.add_argument("--late-recv", action="store_true", help="post receives after the first packet on each worker")
+    parser.add_argument("--exhaust-retries", action="store_true", help="drop data to exercise the PDC error path")
     parser.add_argument("--require-owned-av", action="store_true", help="require the scoped address ownership checks")
     parser.add_argument("--functional-worker-cpus", type=int,
                         help="let test workers share CPUs for functional validation in a small VM")
@@ -136,6 +159,10 @@ def main():
         parser.error("batch polling requires RDMA")
     if args.require_owned_av and not args.parallel_tx:
         parser.error("the address ownership checks require parallel TX")
+    if args.late_recv and (not args.parallel_tx or args.workers != [8] or args.drop_established or args.exhaust_retries):
+        parser.error("late receives require one PDC per worker with parallel TX and eight RX workers")
+    if args.exhaust_retries and (not args.parallel_tx or args.workers != [8] or args.drop_established):
+        parser.error("retry exhaustion requires one PDC per worker with parallel TX and eight RX workers")
     if args.functional_worker_cpus is not None:
         if args.rdma or not 1 <= args.functional_worker_cpus <= max(args.workers):
             parser.error("shared CPUs are available only in the functional veth test")
@@ -176,6 +203,7 @@ def main():
             fixture, *mode, "-L", receiver, "-luet_verbs", "-pthread", "-ldl", "-o", binary], root / "fixture-build.log")
     summary = {"arch": platform.machine(), "mode": "rdma" if args.rdma else "veth functional",
                "tsan": args.tsan,
+               "late_recv": args.late_recv,
                "iterations_per_pdc": args.iterations, "window": args.window, "rx_cpus": rx_cpus,
                "tx_cpus": tx_cpus, "tx_workers": 8 if args.parallel_tx else 1,
                "sender_patch_sha256": None if args.parallel_tx else digest(source_patch),
@@ -193,7 +221,8 @@ def main():
                 for workers in (args.workers[::-1] if i % 2 else args.workers):
                     case = run_case(root / f"r{i}-w{workers}", binary, receiver, sender, args, workers, ports, names)
                     summary["cases"].append(case)
-                    print(f"workers={workers} eight PDCs verified", flush=True)
+                    outcome = "retry exhaustion verified" if args.exhaust_retries else "eight PDCs verified"
+                    print(f"workers={workers} {outcome}", flush=True)
     finally:
         (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 

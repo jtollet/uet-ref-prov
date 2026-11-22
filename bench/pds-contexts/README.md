@@ -10,7 +10,7 @@ thread dispatches frames to pinned workers. The sender has eight fixed
 workers and one ACK dispatcher. Its test fixture uses distinct `PIDonFEP`
 values to keep the eight streams on independent PDCs. Both sides use the
 Verbs build of libuet from [RFC #177](https://github.com/ultraethernet/uet-ref-prov/pull/177)
-at `2a1d1336cb754ef9b4bec342a69f1c91345771b7`. The sender creates a destination
+at `6b39300d00811d29345a7e6e968012e441a53b89`. The sender creates a destination
 handle owned by each context and checks that passing it to a different
 context is rejected.
 
@@ -25,7 +25,7 @@ and `ethtool`. The functional test uses `iproute2` and `iptables`.
 git clone --branch rfc/pds-contexts-benchmark --single-branch \
   https://github.com/jtollet/uet-ref-prov.git uet-pds-bench
 cd uet-pds-bench
-git worktree add --detach ../uet-pds-candidate 2a1d1336cb754ef9b4bec342a69f1c91345771b7
+git worktree add --detach ../uet-pds-candidate 6b39300d00811d29345a7e6e968012e441a53b89
 ```
 
 ## Measure over physical Ethernet
@@ -99,6 +99,16 @@ The comparison checked 6.4 million SENDs across 40 runs. The median rate
 changed by at most 0.26% across these configurations.
 [Per-run rates and validation results](results/av-ownership.json).
 
+## Validation on the final RFC revision
+
+The final revision passed five physical Ethernet runs for each receiver
+worker count with eight fixed sender workers. The median RX rates were
+0.3121, 0.6196, 1.2013 and 1.3736 Mpps for 1, 2, 4 and 8 workers,
+respectively. All 3.2 million 4 KiB SENDs passed payload and ownership
+checks. These rates include the software distributor and frame copies.
+The [validation summary](results/rfc-final-6b39300.json) includes all
+20 per-run rates and the functional results below.
+
 ## Check address ownership and retransmission
 
 This veth run uses eight workers at each endpoint. It drops one data frame
@@ -111,6 +121,30 @@ sudo python3 -B bench/pds-contexts/tools/run_two_ip_probe.py \
   --candidate ../uet-pds-candidate --results /tmp/uet-pds-av-tsan \
   --rx-cpu 4 --tx-cpu 28 --workers 8 --parallel-tx --require-owned-av \
   --drop-established --tsan --iterations 1000 --window 8 --repeat 3
+```
+
+To test a late RECV, omit `--drop-established` and use `--late-recv`
+with a fresh results path. Each worker posts receives after seeing its
+first unexpected message. Three runs delivered 24,000 checked SENDs
+and observed one `No Match` response per PDC per run.
+
+```sh
+sudo python3 -B bench/pds-contexts/tools/run_two_ip_probe.py \
+  --candidate ../uet-pds-candidate --results /tmp/uet-pds-late-tsan \
+  --rx-cpu 4 --tx-cpu 28 --workers 8 --parallel-tx --require-owned-av \
+  --late-recv --tsan --iterations 1000 --window 8 --repeat 3
+```
+
+To exercise the error path after retransmissions are exhausted, use
+`--exhaust-retries` with a fresh results path. It drops data frames and
+requires a `FI_EIO` completion instead of a crash. This run also uses
+ThreadSanitizer.
+
+```sh
+sudo python3 -B bench/pds-contexts/tools/run_two_ip_probe.py \
+  --candidate ../uet-pds-candidate --results /tmp/uet-pds-retry-tsan \
+  --rx-cpu 4 --tx-cpu 28 --workers 8 --parallel-tx --require-owned-av \
+  --exhaust-retries --tsan --iterations 1000 --window 8 --repeat 1
 ```
 
 ## Run on a small VM

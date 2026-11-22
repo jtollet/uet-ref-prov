@@ -138,7 +138,8 @@ static struct worker {
 
 static uint64_t dispatch_frames, dispatch_wall_ns, dispatch_cpu_ns, queue_waits;
 static unsigned pdc_count, established_count;
-static bool drop_established, dropped_frame;
+static bool drop_established, drop_all_data, dropped_frame;
+static bool late_recv;
 static int pdc_owner[UINT16_MAX + 1];
 static uint16_t destination_pdc[UINT16_MAX + 1];
 
@@ -202,6 +203,8 @@ dispatch (void *arg)
               assert (pdc_owner[id] == (int) owner);
               if (!(prologue & UET_PDS_REQ_FLAGS_SYN))
                 {
+                  if (drop_all_data)
+                    continue;
                   uint16_t dpdcid = ntohs (hdr->dpdcid);
                   assert (dpdcid / 64 == owner && dpdcid % 64);
                   if (drop_established && !dropped_frame && destination_pdc[id])
@@ -282,9 +285,16 @@ receive (void *arg)
   physical_select_worker_tx (w->index);
 #endif
   unsigned tail = 0, total = 0, expected = iterations * (FLOWS / workers);
+  bool receives_posted = !late_recv;
   while (!atomic_load_explicit (&stopping, memory_order_relaxed))
     {
       tail = progress_rx (w, tail);
+      if (!receives_posted && tail)
+        {
+          for (unsigned j = 0; j < window; j++)
+            post_rx (w->ep, w->buffers[j]);
+          receives_posted = true;
+        }
       struct fi_cq_data_entry entries[16];
       unsigned count = completions (w->cq, entries);
       for (unsigned i = 0; i < count; i++)
@@ -330,8 +340,9 @@ run_receiver (uet_domain_handle_t domain, struct fi_info *info, unsigned first_c
     {
       struct worker *w = &rx_workers[i];
       check (uet_ep_enable (w->ep), "enable worker context");
-      for (unsigned j = 0; j < RX_DEPTH; j++)
-        post_rx (w->ep, w->buffers[j]);
+      if (!late_recv)
+        for (unsigned j = 0; j < RX_DEPTH; j++)
+          post_rx (w->ep, w->buffers[j]);
 #ifdef SE_USE_RDMA
       physical_open_worker_tx (i);
 #endif
@@ -564,6 +575,8 @@ main (int argc, char **argv)
   assert (argc == 7);
   bool sender = !strcmp (argv[1], "tx");
   drop_established = getenv ("SE_DROP_ESTABLISHED") != NULL;
+  drop_all_data = getenv ("SE_DROP_ALL_DATA") != NULL;
+  late_recv = getenv ("SE_LATE_RECV") != NULL;
   iterations = atoi (argv[2]);
   window = atoi (argv[3]);
   workers = atoi (argv[4]);
